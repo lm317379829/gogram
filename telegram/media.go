@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1324,10 +1325,11 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, ctx
 
 	for curr := start; curr < end; curr += chunkSize {
 		part, err := sender.MakeRequest(&UploadGetFileParams{
-			Location:     input,
-			Limit:        int32(chunkSize),
-			Offset:       int64(curr),
-			CdnSupported: false,
+			Location: input,
+			Limit:    int32(chunkSize),
+			Offset:   int64(curr),
+			//CdnSupported: false,
+			CdnSupported: true, // 这里改为 true
 		})
 
 		if err != nil {
@@ -1339,11 +1341,66 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, ctx
 		case *UploadFileObj:
 			buf = append(buf, v.Bytes...)
 		case *UploadFileCdnRedirect:
-			return nil, "", fmt.Errorf("cdn redirect not implemented")
+			// return nil, "", fmt.Errorf("cdn redirect not implemented")
+			// ==============================================
+			// 新增：CDN 重定向处理（核心逻辑）
+			// ==============================================
+			file, err := c.handleCDNRedirect(v, int32(chunkSize), int64(curr), chunkCtx)
+			if err != nil {
+				return nil, "", err
+			}
+			buf = append(buf, file...)
+
+		default:
+			return nil, "", fmt.Errorf("unsupported response type: %T", part)
 		}
 	}
 
 	return buf, name, nil
+}
+
+// ==============================================
+// 新增：CDN 下载专用方法
+// 连接到 CDN 节点并下载文件块
+// ==============================================
+func (c *Client) switchCdnSender(dcID int) (*ExSender, error) {
+	senders := c.exSenders.GetSenders(dcID)
+	if len(senders) > 0 {
+		return senders[0], nil
+	}
+	conn, err := c.CreateExportedSender(dcID, true)
+	if err != nil {
+		return nil, err
+	}
+	sender := NewExSender(conn)
+	c.exSenders.AddSender(dcID, sender)
+	return sender, nil
+}
+
+func (c *Client) handleCDNRedirect(redirect *UploadFileCdnRedirect, limit int32, offset int64, ctx context.Context) ([]byte, error) {
+	// 获取对应 DC 的 CDN sender
+	cdnSender, err := c.switchCdnSender(int(redirect.DcID))
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("cdn redirect to new DC: %d", redirect.DcID)
+	// 请求 CDN 文件
+	res, err := cdnSender.MakeRequestCtx(ctx, &UploadGetCdnFileParams{
+		FileToken: redirect.FileToken,
+		Limit:     limit,
+		Offset:    offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 解析 CDN 返回的数据
+	if file, ok := res.(*UploadCdnFileObj); ok {
+		return file.Bytes, nil
+	}
+
+	return nil, fmt.Errorf("invalid cdn file response")
 }
 
 // ----------------------- Helper Functions -----------------------
