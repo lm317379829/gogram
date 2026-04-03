@@ -71,8 +71,15 @@ func (c *Client) AnswerCallbackQuery(QueryID int64, Text string, Opts ...*Callba
 
 // BOT COMMANDS
 
-func (c *Client) SetBotCommands(commands []*BotCommand, scope *BotCommandScope, languageCode ...string) (bool, error) {
-	resp, err := c.BotsSetBotCommands(*scope, getVariadic(languageCode, "en"), commands)
+func (c *Client) SetBotCommands(commands []*BotCommand, peer *InputPeer, languageCode ...string) (bool, error) {
+	var scope BotCommandScope = &BotCommandScopeDefault{}
+	if peer != nil {
+		scope = &BotCommandScopePeer{
+			Peer: *peer,
+		}
+	}
+
+	resp, err := c.BotsSetBotCommands(scope, getVariadic(languageCode, ""), commands)
 	if err != nil {
 		return false, err
 	}
