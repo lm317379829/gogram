@@ -9,7 +9,29 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"sync"
 )
+
+const largeBufferThreshold = 128 * 1024 // 128KB
+
+// LargeBytePool reuses large byte buffers (>= 128KB) to reduce heap
+// allocations during file downloads. Callers that receive a large []byte
+// from TL decoding should call ReleaseLargeBuffer when done with it.
+var LargeBytePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1024*1024) // 1MB default
+		return &b
+	},
+}
+
+// ReleaseLargeBuffer returns a large byte buffer to the pool for reuse.
+// It is safe to call with any slice (small slices are ignored).
+func ReleaseLargeBuffer(buf []byte) {
+	if cap(buf) >= largeBufferThreshold {
+		buf = buf[:cap(buf)]
+		LargeBytePool.Put(&buf)
+	}
+}
 
 // A Decoder reads and decodes TL values from an input stream.
 type Decoder struct {
@@ -84,33 +106,33 @@ func (d *Decoder) unread(count int) {
 }
 
 func (d *Decoder) PopLong() int64 {
-	val := make([]byte, LongLen)
-	d.read(val)
+	var val [LongLen]byte
+	d.read(val[:])
 	if d.err != nil {
 		return 0
 	}
 
-	return int64(binary.LittleEndian.Uint64(val))
+	return int64(binary.LittleEndian.Uint64(val[:]))
 }
 
 func (d *Decoder) PopDouble() float64 {
-	val := make([]byte, DoubleLen)
-	d.read(val)
+	var val [DoubleLen]byte
+	d.read(val[:])
 	if d.err != nil {
 		return 0
 	}
 
-	return math.Float64frombits(binary.LittleEndian.Uint64(val))
+	return math.Float64frombits(binary.LittleEndian.Uint64(val[:]))
 }
 
 func (d *Decoder) PopUint() uint32 {
-	val := make([]byte, WordLen)
-	d.read(val)
+	var val [WordLen]byte
+	d.read(val[:])
 	if d.err != nil {
 		return 0
 	}
 
-	return binary.LittleEndian.Uint32(val)
+	return binary.LittleEndian.Uint32(val[:])
 }
 
 func (d *Decoder) PopRawBytes(size int) []byte {
@@ -226,14 +248,13 @@ func (d *Decoder) popVector(as reflect.Type, ignoreCRC bool) any {
 }
 
 func (d *Decoder) PopMessage() []byte {
-	val := []byte{0}
-
-	d.read(val)
+	var first [1]byte
+	d.read(first[:])
 	if d.err != nil {
 		return nil
 	}
 
-	firstByte := val[0]
+	firstByte := first[0]
 
 	var realSize int
 	var lenNumberSize int
@@ -242,39 +263,50 @@ func (d *Decoder) PopMessage() []byte {
 		realSize = int(firstByte)
 		lenNumberSize = 1
 	} else {
-
-		val = make([]byte, WordLen-1)
-		d.read(val)
+		var sizeBuf [WordLen - 1]byte
+		d.read(sizeBuf[:])
 		if d.err != nil {
 			d.err = fmt.Errorf("reading last %v bytes of message size: %w", WordLen-1, d.err)
 			return nil
 		}
 
-		val = append(val, 0x0)
-
-		realSize = int(binary.LittleEndian.Uint32(val))
+		realSize = int(uint32(sizeBuf[0]) | uint32(sizeBuf[1])<<8 | uint32(sizeBuf[2])<<16)
 		lenNumberSize = WordLen
 	}
 
-	buf := make([]byte, realSize)
+	var buf []byte
+	var pooled *[]byte
+	if realSize >= largeBufferThreshold {
+		pooled = LargeBytePool.Get().(*[]byte)
+		if cap(*pooled) < realSize {
+			*pooled = make([]byte, realSize)
+		}
+		buf = (*pooled)[:realSize]
+	} else {
+		buf = make([]byte, realSize)
+	}
 	d.read(buf)
 	if d.err != nil {
 		d.err = fmt.Errorf("reading message data with len of %v: %w", realSize, d.err)
+		if pooled != nil {
+			LargeBytePool.Put(pooled)
+		}
 		return nil
 	}
 
 	readLen := lenNumberSize + realSize
 	if readLen%WordLen != 0 {
-		voidBytes := make([]byte, WordLen-readLen%WordLen)
-		d.read(voidBytes)
+		pad := WordLen - readLen%WordLen
+		var voidBytes [WordLen - 1]byte
+		d.read(voidBytes[:pad])
 		if d.err != nil {
-			d.err = fmt.Errorf("reading %v last void bytes: %w", WordLen-readLen%WordLen, d.err)
+			d.err = fmt.Errorf("reading %v last void bytes: %w", pad, d.err)
 			return nil
 		}
 
-		for _, b := range voidBytes {
+		for _, b := range voidBytes[:pad] {
 			if b != 0 {
-				d.err = fmt.Errorf("some of void bytes doesn't equal zero: %#v", voidBytes)
+				d.err = fmt.Errorf("some of void bytes doesn't equal zero: %#v", voidBytes[:pad])
 				return nil
 			}
 		}
