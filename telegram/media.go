@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2025 @AmarnathCJD
+// Copyright (c) 2025 @AmarnathCJD
 
 package telegram
 
@@ -1427,7 +1427,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, pre
 	defer w.FreeWorker(sender)
 
 	for curr := start; curr < end; curr += chunkSize {
-		part, err := sender.MakeRequest(&UploadGetFileParams{
+		part, err := sender.MakeRequestCtx(chunkCtx, &UploadGetFileParams{
 			Location:     input,
 			Limit:        int32(chunkSize),
 			Offset:       int64(curr),
