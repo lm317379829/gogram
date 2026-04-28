@@ -1436,7 +1436,16 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, pre
 		})
 
 		if err != nil {
-			// c.Log.Error(err)
+			// TCP 假死/超时检测: 触发重连, 使下次调用有活跃连接
+			errStr := strings.ToLower(err.Error())
+			if !sender.MTProto.IsTcpActive() || strings.Contains(errStr, "deadline exceeded") {
+				if strings.Contains(errStr, "deadline exceeded") {
+					_ = sender.Redial()
+					time.Sleep(250 * time.Millisecond)
+				} else {
+					_ = sender.Reconnect(false)
+				}
+			}
 			return nil, "", err
 		}
 
