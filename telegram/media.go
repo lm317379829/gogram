@@ -1407,46 +1407,71 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, pre
 		return nil, "", err
 	}
 
-	var chunkCtx context.Context
-	var chunkCancel context.CancelFunc
-	if ctx != nil {
-		chunkCtx, chunkCancel = context.WithTimeout(ctx, timeout)
-	} else {
-		chunkCtx, chunkCancel = context.WithTimeout(context.Background(), timeout)
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
 	}
-	defer chunkCancel()
 
-	if !w.WaitReady(chunkCtx) {
+	// 用独立超时获取 worker, 不与请求超时绑定
+	waitCtx, waitCancel := context.WithTimeout(baseCtx, timeout)
+	if !w.WaitReady(waitCtx) {
+		waitCancel()
 		return nil, "", errors.New("failed to initialize worker: timeout")
 	}
 
-	sender := w.NextWithContext(chunkCtx)
+	sender := w.NextWithContext(waitCtx)
+	waitCancel()
 	if sender == nil {
 		return nil, "", errors.New("failed to get worker: timeout")
 	}
 	defer w.FreeWorker(sender)
 
 	for curr := start; curr < end; curr += chunkSize {
-		part, err := sender.MakeRequestCtx(chunkCtx, &UploadGetFileParams{
-			Location:     input,
-			Limit:        int32(chunkSize),
-			Offset:       int64(curr),
-			Precise:      precise,
-			CdnSupported: true, // 这里改为 true
-		})
+		var part any
+		var lastErr error
 
-		if err != nil {
-			// TCP 假死/超时检测: 触发重连, 使下次调用有活跃连接
-			errStr := strings.ToLower(err.Error())
-			if !sender.MTProto.IsTcpActive() || strings.Contains(errStr, "deadline exceeded") {
-				if strings.Contains(errStr, "deadline exceeded") {
+		// 最多尝试 2 次: 首次超时后内部 Redial 重试, 避免调用者重建 WorkerPool
+		for attempt := 0; attempt < 2; attempt++ {
+			reqCtx, reqCancel := context.WithTimeout(baseCtx, timeout)
+			part, lastErr = sender.MakeRequestCtx(reqCtx, &UploadGetFileParams{
+				Location:     input,
+				Limit:        int32(chunkSize),
+				Offset:       int64(curr),
+				Precise:      precise,
+				CdnSupported: true,
+			})
+			reqCancel()
+
+			if lastErr == nil {
+				break
+			}
+
+			// 父 context 已取消, 不重试
+			if baseCtx.Err() != nil {
+				return nil, name, lastErr
+			}
+
+			errStr := strings.ToLower(lastErr.Error())
+			isTimeout := strings.Contains(errStr, "deadline exceeded")
+			isTcpDead := !sender.MTProto.IsTcpActive()
+
+			// 仅首次尝试时触发重连并内部重试
+			if (isTimeout || isTcpDead) && attempt == 0 {
+				if isTimeout {
 					_ = sender.Redial()
-					time.Sleep(250 * time.Millisecond)
 				} else {
 					_ = sender.Reconnect(false)
 				}
+				time.Sleep(500 * time.Millisecond)
+				continue
 			}
-			return nil, "", err
+
+			// 非超时错误或第二次仍失败, 直接返回
+			break
+		}
+
+		if lastErr != nil {
+			return nil, name, lastErr
 		}
 
 		switch v := part.(type) {
@@ -1455,18 +1480,14 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, pre
 			tl.ReleaseLargeBuffer(v.Bytes)
 			v.Bytes = nil
 		case *UploadFileCdnRedirect:
-			// return nil, "", fmt.Errorf("cdn redirect not implemented")
-			// ==============================================
-			// 新增：CDN 重定向处理（核心逻辑）
-			// ==============================================
-			file, err := c.handleCDNRedirect(v, int32(chunkSize), int64(curr), chunkCtx)
+			file, err := c.handleCDNRedirect(v, int32(chunkSize), int64(curr), baseCtx)
 			if err != nil {
-				return nil, "", err
+				return nil, name, err
 			}
 			buf = append(buf, file...)
 
 		default:
-			return nil, "", fmt.Errorf("unsupported response type: %T", part)
+			return nil, name, fmt.Errorf("unsupported response type: %T", part)
 		}
 	}
 
