@@ -1072,7 +1072,7 @@ func (m *MTProto) Reconnect(loggy bool) error {
 	}
 
 	if m.transport != nil {
-		m.Ping()
+		m.Ping(context.Background())
 	}
 
 	return nil
@@ -1121,25 +1121,28 @@ func (m *MTProto) longPing(ctx context.Context) {
 			if err := m.tcpState.WaitForActive(ctx); err != nil {
 				return
 			}
-			m.Ping()
+			m.Ping(ctx)
 		}
 	}
 }
 
-func (m *MTProto) Ping() time.Duration {
+func (m *MTProto) Ping(ctx context.Context) (time.Duration, error) {
 	if m.transport == nil || !m.IsTcpActive() {
 		m.Logger.Debug("ping skipped: transport unavailable")
-		return 0
+		return 0, fmt.Errorf("transport unavailable or inactive")
 	}
 	start := time.Now()
 	m.Logger.Trace("sending ping")
-	if err := m.InvokeRequestWithoutUpdate(&utils.PingParams{
+	
+	_, err := m.makeRequestCtx(ctx, &utils.PingParams{
 		PingID: time.Now().Unix(),
-	}); err != nil {
+	}, reflect.TypeOf(&objects.Pong{}))
+
+	if err != nil {
 		m.Logger.Debug("ping failed: %v", err)
-		return -1
+		return -1, err
 	}
-	return time.Since(start)
+	return time.Since(start), nil
 }
 
 func (m *MTProto) tryReconnect() error {
@@ -1415,6 +1418,7 @@ messageTypeSwitching:
 		} else {
 			m.Logger.Trace("received pong")
 		}
+		_ = m.writeRPCResponse(int(message.MsgID), message)
 
 	case *objects.MsgsAck:
 		// do nothing

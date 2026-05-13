@@ -65,6 +65,7 @@ func NewTCP(cfg TCPConnConfig) (Conn, bool, error) {
 	}
 
 	conn.SetKeepAlive(true)
+	conn.SetKeepAlivePeriod(30 * time.Second)
 
 	if cfg.Logger != nil {
 		cfg.Logger.Trace("[tcp] connected to %s", cfg.Host)

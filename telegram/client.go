@@ -742,8 +742,8 @@ func (c *Client) SetParseMode(mode string) {
 }
 
 // Ping telegram server TCP connection
-func (c *Client) Ping() time.Duration {
-	return c.MTProto.Ping()
+func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
+	return c.MTProto.Ping(ctx)
 }
 
 // Gets the connected DC-ID
