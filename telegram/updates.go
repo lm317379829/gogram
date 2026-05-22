@@ -98,6 +98,7 @@ type middlewareManager struct {
 	album          []func(AlbumHandler) AlbumHandler
 	inline         []func(InlineHandler) InlineHandler
 	inlineSend     []func(InlineSendHandler) InlineSendHandler
+	guestChat      []func(GuestChatQueryHandler) GuestChatQueryHandler
 	callback       []func(CallbackHandler) CallbackHandler
 	inlineCallback []func(InlineCallbackHandler) InlineCallbackHandler
 	participant    []func(ParticipantHandler) ParticipantHandler
@@ -145,6 +146,12 @@ func (mm *middlewareManager) inlineSends() []func(InlineSendHandler) InlineSendH
 	mm.RLock()
 	defer mm.RUnlock()
 	return slices.Clone(mm.inlineSend)
+}
+
+func (mm *middlewareManager) guestChats() []func(GuestChatQueryHandler) GuestChatQueryHandler {
+	mm.RLock()
+	defer mm.RUnlock()
+	return slices.Clone(mm.guestChat)
 }
 
 func (mm *middlewareManager) callbacks() []func(CallbackHandler) CallbackHandler {
@@ -506,7 +513,6 @@ func newCounterBox(name string, logger Logger, fetch func(from, target int32), o
 // If the counter is contiguous, apply() is executed immediately; otherwise it is buffered and a gap fetch is triggered.
 func (b *counterBox) process(counter, count int32, apply func()) bool {
 	if counter == 0 {
-		// Some updates carry no counter; process eagerly.
 		apply()
 		return true
 	}
@@ -519,7 +525,6 @@ func (b *counterBox) process(counter, count int32, apply func()) bool {
 		prev = 0
 	}
 
-	// First seen value: accept and set baseline.
 	if b.current == 0 {
 		b.current = counter
 		b.recordAdvance(counter)
@@ -528,12 +533,15 @@ func (b *counterBox) process(counter, count int32, apply func()) bool {
 		return true
 	}
 
-	// Duplicate or stale update.
-	if counter <= b.current {
+	if counter == b.current {
+		b.runUnlocked(apply)
+		return true
+	}
+
+	if counter < b.current {
 		return false
 	}
 
-	// Happy path: contiguous advance.
 	if prev == b.current {
 		b.current = counter
 		b.recordAdvance(counter)
@@ -542,7 +550,7 @@ func (b *counterBox) process(counter, count int32, apply func()) bool {
 		return true
 	}
 
-	// Gap detected: store and trigger gap fetch if not already recovering.
+	b.logger.Debug("counterBox=%s gap counter=%d count=%d boxCurrent=%d -> buffering", b.name, counter, count, b.current)
 	b.pending[counter] = append(b.pending[counter], pendingCounter{counter: counter, count: count, apply: apply, arrived: time.Now()})
 	b.triggerGapLocked(prev, counter)
 	return false
@@ -695,6 +703,7 @@ type DeleteHandler func(m *DeleteMessage) error
 type AlbumHandler func(m *Album) error
 type InlineHandler func(m *InlineQuery) error
 type InlineSendHandler func(m *InlineSend) error
+type GuestChatQueryHandler func(m *GuestChatQuery) error
 type CallbackHandler func(m *CallbackQuery) error
 type InlineCallbackHandler func(m *InlineCallbackQuery) error
 type ParticipantHandler func(m *ParticipantUpdate) error
@@ -798,6 +807,11 @@ type inlineHandle struct {
 type inlineSendHandle struct {
 	baseHandle
 	Handler InlineSendHandler
+}
+
+type guestChatHandle struct {
+	baseHandle
+	Handler GuestChatQueryHandler
 }
 
 type callbackHandle struct {
@@ -924,6 +938,7 @@ type UpdateDispatcher struct {
 	messageHandles        map[int][]*messageHandle
 	inlineHandles         map[int][]*inlineHandle
 	inlineSendHandles     map[int][]*inlineSendHandle
+	guestChatHandles      map[int][]*guestChatHandle
 	callbackHandles       map[int][]*callbackHandle
 	inlineCallbackHandles map[int][]*inlineCallbackHandle
 	participantHandles    map[int][]*participantHandle
@@ -1107,6 +1122,7 @@ func (c *Client) NewUpdateDispatcher(sessionName ...string) {
 		messageHandles:        make(map[int][]*messageHandle),
 		inlineHandles:         make(map[int][]*inlineHandle),
 		inlineSendHandles:     make(map[int][]*inlineSendHandle),
+		guestChatHandles:      make(map[int][]*guestChatHandle),
 		callbackHandles:       make(map[int][]*callbackHandle),
 		inlineCallbackHandles: make(map[int][]*inlineCallbackHandle),
 		participantHandles:    make(map[int][]*participantHandle),
@@ -1199,6 +1215,8 @@ func (c *Client) removeHandle(handle Handle) error {
 		removeHandleFromMap(h, c.dispatcher.rawHandles)
 	case *inlineSendHandle:
 		removeHandleFromMap(h, c.dispatcher.inlineSendHandles)
+	case *guestChatHandle:
+		removeHandleFromMap(h, c.dispatcher.guestChatHandles)
 	default:
 		return errors.New("[InvalidHandlerType] handle type not supported")
 	}
@@ -1723,6 +1741,44 @@ func (c *Client) handleInlineSendUpdate(update *UpdateBotInlineSend) {
 							return
 						}
 						c.Log.WithError(err).Error("[InlineSendHandler]")
+					}
+				}()
+			} else {
+				if err := handle(handler); err != nil && errors.Is(err, ErrEndGroup) {
+					break
+				}
+			}
+		}
+	}
+}
+
+func (c *Client) handleGuestChatUpdate(update *UpdateBotGuestChatQuery) {
+	packed := packGuestChatQuery(c, update)
+
+	c.dispatcher.RLock()
+	guestChatHandles := make(map[int][]*guestChatHandle)
+	maps.Copy(guestChatHandles, c.dispatcher.guestChatHandles)
+	c.dispatcher.RUnlock()
+
+	for group, handlers := range guestChatHandles {
+		for _, handler := range handlers {
+			handle := func(h *guestChatHandle) error {
+				defer c.NewRecovery()()
+				hf := h.Handler
+				if mm := c.dispatcher.middlewareManager; mm != nil {
+					hf = applyChain(hf, mm.guestChats())
+				}
+				return hf(packed)
+			}
+
+			if group == DefaultGroup {
+				go func() {
+					err := handle(handler)
+					if err != nil {
+						if errors.Is(err, ErrEndGroup) {
+							return
+						}
+						c.Log.WithError(err).Error("[GuestChatQueryHandler]")
 					}
 				}()
 			} else {
@@ -2555,6 +2611,19 @@ func (c *Client) AddInlineHandler(pattern any, handler InlineHandler) Handle {
 	return addHandleToMap(c.dispatcher.inlineHandles, h)
 }
 
+func (c *Client) AddGuestChatHandler(handler GuestChatQueryHandler) Handle {
+	c.dispatcher.Lock()
+	defer c.dispatcher.Unlock()
+	handleID := nextHandleID()
+	h := &guestChatHandle{
+		Handler:    handler,
+		baseHandle: baseHandle{id: handleID, Group: DefaultGroup},
+	}
+	h.onGroupChanged = makeGroupChangeCallback(c.dispatcher.guestChatHandles, h, handleID, &c.dispatcher.RWMutex)
+	h.onPriorityChanged = makePriorityChangeCallback(c.dispatcher.guestChatHandles, h, handleID, h.GetGroup, h.GetPriority, &c.dispatcher.RWMutex)
+	return addHandleToMap(c.dispatcher.guestChatHandles, h)
+}
+
 func (c *Client) AddInlineSendHandler(handler InlineSendHandler) Handle {
 	c.dispatcher.Lock()
 	defer c.dispatcher.Unlock()
@@ -2733,10 +2802,6 @@ func (c *Client) applyIncomingUpdate(update Update) {
 	}
 
 	meta := extractUpdateMeta(update)
-	if meta.pts != 0 && meta.ptsCount == 0 {
-		meta.ptsCount = 1
-	}
-
 	c.processWithState(meta, func() {
 		c.dispatchUpdate(update)
 	})
@@ -2783,6 +2848,8 @@ func (c *Client) dispatchUpdate(update Update) {
 		go c.handleJoinRequestUpdate(upd)
 	case *UpdateBotInlineSend:
 		go c.handleInlineSendUpdate(upd)
+	case *UpdateBotGuestChatQuery:
+		go c.handleGuestChatUpdate(upd)
 	case *UpdateChannelTooLong:
 		currentPts := c.dispatcher.GetChannelPts(upd.ChannelID)
 		if upd.Pts != 0 {
@@ -2911,7 +2978,6 @@ func extractUpdateMeta(update Update) updateMeta {
 		meta.ptsCount = upd.PtsCount
 	case *UpdateReadChannelInbox:
 		meta.pts = upd.Pts
-		meta.ptsCount = 1
 		meta.channel = upd.ChannelID
 	case *UpdateChannelWebPage:
 		meta.pts = upd.Pts
@@ -2938,6 +3004,8 @@ func extractUpdateMeta(update Update) updateMeta {
 		meta.channel = getChannelIDFromPeer(upd.Peer)
 	case *UpdateNewEncryptedMessage:
 		meta.qts = upd.Qts
+	case *UpdateBotGuestChatQuery:
+		meta.qts = upd.Qts
 	case *UpdateBotInlineSend:
 	}
 
@@ -2961,7 +3029,9 @@ func (c *Client) processWithState(meta updateMeta, apply func()) bool {
 	}
 
 	if meta.pts != 0 && meta.ptsCount == 0 {
-		meta.ptsCount = 1
+		applyCheckpoint(d, meta)
+		apply()
+		return true
 	}
 
 	if meta.qts != 0 && d.globalQtsBox != nil {
@@ -2980,6 +3050,20 @@ func (c *Client) processWithState(meta updateMeta, apply func()) bool {
 
 	apply()
 	return true
+}
+
+func applyCheckpoint(d *UpdateDispatcher, meta updateMeta) {
+	if meta.channel != 0 {
+		if box := d.getChannelBox(meta.channel); box != nil {
+			if meta.pts > box.currentValue() {
+				box.forceSet(meta.pts)
+			}
+		}
+		return
+	}
+	if d.globalPtsBox != nil && meta.pts > d.globalPtsBox.currentValue() {
+		d.globalPtsBox.forceSet(meta.pts)
+	}
 }
 
 func (c *Client) FetchDifference(fromPts int32, limit int32) {
@@ -3147,6 +3231,7 @@ func (c *Client) manageSeq(seq int32, seqStart int32) bool {
 
 	if expectedSeqStart > seqStart {
 		d.Unlock()
+		c.Log.Debug("manageSeq stale seq=%d seqStart=%d currentSeq=%d -> drop", seq, seqStart, currentSeq)
 		return false
 	}
 
@@ -3597,6 +3682,7 @@ var handlerTypes = map[string]string{
 	"func(*telegram.Album) error":                   "album",
 	"func(*telegram.InlineQuery) error":             "inline",
 	"func(*telegram.InlineSend) error":              "choseninline",
+	"func(*telegram.GuestChatQuery) error":          "guestchat",
 	"func(*telegram.CallbackQuery) error":           "callback",
 	"func(*telegram.InlineCallbackQuery) error":     "inlinecallback",
 	"func(*telegram.ParticipantUpdate) error":       "participant",
@@ -3713,6 +3799,12 @@ func (c *Client) On(args ...any) Handle {
 		}
 		c.Log.Error("On(choseninline): invalid handler type %T, expected func(*InlineSend) error", handler)
 
+	case "guestchat", "botguestchat":
+		if h, ok := handler.(func(m *GuestChatQuery) error); ok {
+			return c.AddGuestChatHandler(h)
+		}
+		c.Log.Error("On(guestchat): invalid handler type %T, expected func(*GuestChatQuery) error", handler)
+
 	case "callback", "callbackquery":
 		if h, ok := handler.(func(m *CallbackQuery) error); ok {
 			p := info.pattern
@@ -3771,6 +3863,8 @@ func (c *Client) On(args ...any) Handle {
 			return c.AddInlineHandler(string(OnInlineQuery), h)
 		case func(m *InlineSend) error:
 			return c.AddInlineSendHandler(h)
+		case func(m *GuestChatQuery) error:
+			return c.AddGuestChatHandler(h)
 		case func(m *CallbackQuery) error:
 			return c.AddCallbackHandler(string(OnCallbackQuery), h, filters...)
 		case func(m *InlineCallbackQuery) error:
@@ -3835,6 +3929,10 @@ func Use[H any](c *Client, middlewares ...func(H) H) {
 	case InlineSendHandler:
 		for _, mw := range middlewares {
 			mm.inlineSend = append(mm.inlineSend, any(mw).(func(InlineSendHandler) InlineSendHandler))
+		}
+	case GuestChatQueryHandler:
+		for _, mw := range middlewares {
+			mm.guestChat = append(mm.guestChat, any(mw).(func(GuestChatQueryHandler) GuestChatQueryHandler))
 		}
 	case CallbackHandler:
 		for _, mw := range middlewares {
@@ -3952,6 +4050,11 @@ func (c *Client) OnAlbum(handler func(m *Album) error) Handle {
 // OnChosenInline registers a chosen inline handler and returns a handle
 func (c *Client) OnChosenInline(handler func(m *InlineSend) error) Handle {
 	return c.AddInlineSendHandler(handler)
+}
+
+// OnGuestChat registers a bot guest-chat query handler and returns a handle
+func (c *Client) OnGuestChat(handler func(m *GuestChatQuery) error) Handle {
+	return c.AddGuestChatHandler(handler)
 }
 
 // OnParticipant registers a participant handler and returns a handle
