@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"hash"
@@ -894,6 +895,8 @@ type DownloadOptions struct {
 	Delay            int                 // Delay between chunks in milliseconds
 	DCId             int32               // Datacenter ID where file is stored
 	TakeoutID        int64               // Download file using takeout api
+	Resume           bool                // Resume interrupted download
+	ResumeStateInterval time.Duration    // Interval to flush resume state to disk (default 3s)
 	// Buffer is the download destination. Supported types:
 	//   io.WriterAt (*os.File, custom) — parallel writes, no intermediate buffer (fastest)
 	//   io.Writer (*bytes.Buffer, net.Conn, etc.) — buffered, copied at end
@@ -1079,6 +1082,34 @@ func (c *Client) DownloadMedia(file any, Opts ...*DownloadOptions) (string, erro
 	}
 	defer downloadCancel()
 
+	var rState *resumeState
+	if opts.Resume && opts.Buffer == nil && dest != "" && dest != ":mem-buffer:" && dest != ":direct-writer:" {
+		locKey := locationKey(location)
+		rPath := resumeStatePath(dest)
+		var err error
+		rState, err = loadResumeState(rPath, size, int(partSize), locKey)
+		if err != nil || rState == nil {
+			rState = newResumeState(rPath, size, int(partSize), locKey)
+			if flushErr := rState.flush(); flushErr != nil {
+				c.Log.Debug("failed to create resume state file: %v", flushErr)
+				rState = nil
+			}
+		}
+		if rState != nil {
+			interval := opts.ResumeStateInterval
+			if interval <= 0 {
+				interval = 3 * time.Second
+			}
+			rState.startFlusher(downloadCtx.Done(), interval, c.Log)
+			for p := 0; p < totalParts; p++ {
+				if rState.has(p) {
+					completedParts[p].Store(true)
+				}
+			}
+			doneBytes.Store(rState.completedBytes())
+		}
+	}
+
 	downloadPart := func(partNum int, retryCount int) bool {
 		select {
 		case <-downloadCtx.Done():
@@ -1177,6 +1208,9 @@ func (c *Client) DownloadMedia(file any, Opts ...*DownloadOptions) (string, erro
 			v.Bytes = nil
 			if completedParts[partNum].CompareAndSwap(false, true) {
 				doneBytes.Add(int64(n))
+				if rState != nil {
+					rState.mark(partNum)
+				}
 			}
 			downloadLog.recordSuccess(partNum, sender)
 			return true
@@ -1313,6 +1347,10 @@ func (c *Client) DownloadMedia(file any, Opts ...*DownloadOptions) (string, erro
 		"file_name": dest,
 		"file_size": SizetoHuman(size),
 	}).Info("file download completed")
+
+	if rState != nil {
+		rState.remove()
+	}
 
 	return dest, nil
 }
@@ -1956,4 +1994,234 @@ func MediaDownloadProgress(editMsg *NewMessage, inline ...*InputBotInlineMessage
 			editMsg.Edit(message)
 		}
 	}
+}
+
+const (
+	resumeMagic   uint32 = 0x444C5231
+	resumeVersion uint16 = 1
+)
+
+type resumeState struct {
+	mu         sync.Mutex
+	path       string
+	size       int64
+	partSize   int
+	totalParts int
+	locKey     []byte
+	bitmap     []byte
+	dirty      bool
+}
+
+func resumeStatePath(dest string) string {
+	return dest + ".partstate"
+}
+
+func locationKey(loc InputFileLocation) []byte {
+	if loc == nil {
+		return nil
+	}
+	buf := make([]byte, 4+8+8)
+	binary.LittleEndian.PutUint32(buf[0:4], loc.CRC())
+	switch v := loc.(type) {
+	case *InputDocumentFileLocation:
+		binary.LittleEndian.PutUint64(buf[4:12], uint64(v.ID))
+		binary.LittleEndian.PutUint64(buf[12:20], uint64(v.AccessHash))
+	case *InputPhotoFileLocation:
+		binary.LittleEndian.PutUint64(buf[4:12], uint64(v.ID))
+		binary.LittleEndian.PutUint64(buf[12:20], uint64(v.AccessHash))
+	case *InputEncryptedFileLocation:
+		binary.LittleEndian.PutUint64(buf[4:12], uint64(v.ID))
+		binary.LittleEndian.PutUint64(buf[12:20], uint64(v.AccessHash))
+	case *InputFileLocationObj:
+		binary.LittleEndian.PutUint64(buf[4:12], uint64(v.VolumeID))
+		binary.LittleEndian.PutUint64(buf[12:20], uint64(v.Secret))
+	default:
+		return buf[:4]
+	}
+	return buf
+}
+
+func newResumeState(path string, size int64, partSize int, locKey []byte) *resumeState {
+	totalParts := int((size + int64(partSize) - 1) / int64(partSize))
+	return &resumeState{
+		path:       path,
+		size:       size,
+		partSize:   partSize,
+		totalParts: totalParts,
+		locKey:     locKey,
+		bitmap:     make([]byte, (totalParts+7)/8),
+	}
+}
+
+func loadResumeState(path string, size int64, partSize int, locKey []byte) (*resumeState, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	header := make([]byte, 32)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+	if binary.LittleEndian.Uint32(header[0:4]) != resumeMagic {
+		return nil, errors.New("not a resume state file")
+	}
+	if binary.LittleEndian.Uint16(header[4:6]) != resumeVersion {
+		return nil, errors.New("unsupported resume state version")
+	}
+	storedSize := int64(binary.LittleEndian.Uint64(header[8:16]))
+	storedPartSize := int(binary.LittleEndian.Uint32(header[16:20]))
+	storedTotalParts := int(binary.LittleEndian.Uint32(header[20:24]))
+	locKeyLen := int(binary.LittleEndian.Uint32(header[24:28]))
+
+	if storedSize != size || storedPartSize != partSize {
+		return nil, errors.New("size or partSize changed")
+	}
+	expectedTotal := int((size + int64(partSize) - 1) / int64(partSize))
+	if storedTotalParts != expectedTotal {
+		return nil, errors.New("totalParts mismatch")
+	}
+
+	storedLocKey := make([]byte, locKeyLen)
+	if locKeyLen > 0 {
+		if _, err := io.ReadFull(f, storedLocKey); err != nil {
+			return nil, fmt.Errorf("read locKey: %w", err)
+		}
+	}
+	if len(locKey) > 0 && len(storedLocKey) > 0 {
+		if !bytes.Equal(locKey, storedLocKey) {
+			return nil, errors.New("location key mismatch")
+		}
+	}
+
+	bitmapLen := (storedTotalParts + 7) / 8
+	bitmap := make([]byte, bitmapLen)
+	if _, err := io.ReadFull(f, bitmap); err != nil {
+		return nil, fmt.Errorf("read bitmap: %w", err)
+	}
+
+	return &resumeState{
+		path:       path,
+		size:       size,
+		partSize:   partSize,
+		totalParts: storedTotalParts,
+		locKey:     locKey,
+		bitmap:     bitmap,
+	}, nil
+}
+
+func (s *resumeState) has(part int) bool {
+	if part < 0 || part >= s.totalParts {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bitmap[part/8]&(1<<(part%8)) != 0
+}
+
+func (s *resumeState) mark(part int) {
+	if part < 0 || part >= s.totalParts {
+		return
+	}
+	s.mu.Lock()
+	mask := byte(1 << (part % 8))
+	if s.bitmap[part/8]&mask == 0 {
+		s.bitmap[part/8] |= mask
+		s.dirty = true
+	}
+	s.mu.Unlock()
+}
+
+func (s *resumeState) completedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total int64
+	for p := 0; p < s.totalParts; p++ {
+		if s.bitmap[p/8]&(1<<(p%8)) != 0 {
+			partLen := int64(s.partSize)
+			offset := int64(p) * int64(s.partSize)
+			if remaining := s.size - offset; remaining < partLen {
+				partLen = remaining
+			}
+			total += partLen
+		}
+	}
+	return total
+}
+
+func (s *resumeState) flush() error {
+	s.mu.Lock()
+	if !s.dirty {
+		s.mu.Unlock()
+		return nil
+	}
+	bitmap := make([]byte, len(s.bitmap))
+	copy(bitmap, s.bitmap)
+	s.dirty = false
+	s.mu.Unlock()
+
+	tmp := s.path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		return err
+	}
+	header := make([]byte, 32)
+	binary.LittleEndian.PutUint32(header[0:4], resumeMagic)
+	binary.LittleEndian.PutUint16(header[4:6], resumeVersion)
+	binary.LittleEndian.PutUint64(header[8:16], uint64(s.size))
+	binary.LittleEndian.PutUint32(header[16:20], uint32(s.partSize))
+	binary.LittleEndian.PutUint32(header[20:24], uint32(s.totalParts))
+	binary.LittleEndian.PutUint32(header[24:28], uint32(len(s.locKey)))
+	if _, err := f.Write(header); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if len(s.locKey) > 0 {
+		if _, err := f.Write(s.locKey); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+	}
+	if _, err := f.Write(bitmap); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func (s *resumeState) remove() {
+	_ = os.Remove(s.path)
+}
+
+func (s *resumeState) startFlusher(stop <-chan struct{}, interval time.Duration, log Logger) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				if err := s.flush(); err != nil && log != nil {
+					log.Debug("resume state final flush failed: %v", err)
+				}
+				return
+			case <-ticker.C:
+				if err := s.flush(); err != nil && log != nil {
+					log.Debug("resume state flush failed: %v", err)
+				}
+			}
+		}
+	}()
 }
