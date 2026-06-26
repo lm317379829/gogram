@@ -1117,7 +1117,7 @@ func (m *MTProto) Reconnect(loggy bool) error {
 	}
 
 	if m.transport != nil {
-		m.Ping(context.Background())
+		_, _ = m.Ping(context.Background())
 	}
 
 	return nil
@@ -1166,7 +1166,7 @@ func (m *MTProto) longPing(ctx context.Context) {
 			if err := m.tcpState.WaitForActive(ctx); err != nil {
 				return
 			}
-			m.Ping(ctx)
+			_, _ = m.Ping(ctx)
 		}
 	}
 }
@@ -1232,11 +1232,9 @@ func (m *MTProto) Ping(ctx context.Context) (time.Duration, error) {
 	}
 	start := time.Now()
 	m.Logger.Trace("sending ping")
-	
 	_, err := m.makeRequestCtx(ctx, &utils.PingParams{
 		PingID: time.Now().Unix(),
 	}, reflect.TypeOf(&objects.Pong{}))
-
 	if err != nil {
 		m.Logger.Debug("ping failed: %v", err)
 		return -1, err

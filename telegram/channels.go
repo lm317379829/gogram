@@ -273,8 +273,10 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 	var totalCount int32
 
 	for {
-		remaining := opts.Limit - int32(fetched)
-		reqLimit = min(remaining, 200)
+		reqLimit = 200
+		if opts.Limit > 0 {
+			reqLimit = min(opts.Limit-int32(fetched), 200)
+		}
 
 		participants, err := c.ChannelsGetParticipants(&InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash}, opts.Filter, reqOffset, reqLimit, 0)
 		if err != nil {
@@ -299,7 +301,8 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 			fetched++
 		}
 
-		if fetched >= opts.Limit || len(cParts.Participants) == 0 {
+		if len(cParts.Participants) < int(reqLimit) || (opts.Limit > 0 && fetched >= opts.Limit) {
+			totalCount = cParts.Count
 			break
 		}
 
@@ -311,14 +314,41 @@ func (c *Client) GetChatMembers(chatID any, Opts ...*ParticipantOptions) ([]*Par
 	return participantsList, totalCount, nil
 }
 
+// GetChatMembersCount returns the total participant count for the given channel or group
+func (c *Client) GetChatMembersCount(chatID any) (int32, error) {
+	peer, err := c.ResolvePeer(chatID)
+	if err != nil {
+		return 0, err
+	}
+	chat, ok := peer.(*InputPeerChannel)
+	if !ok {
+		return 0, fmt.Errorf("peer is not a channel, but %T", peer)
+	}
+	resp, err := c.MakeRequest(&ChannelsGetParticipantsParams{
+		Channel: &InputChannelObj{ChannelID: chat.ChannelID, AccessHash: chat.AccessHash},
+		Filter:  &ChannelParticipantsSearch{},
+		Limit:   0,
+	})
+	if err != nil {
+		return 0, err
+	}
+	switch r := resp.(type) {
+	case *ChannelsChannelParticipantsObj:
+		return r.Count, nil
+	default:
+		return 0, fmt.Errorf("unexpected response: %T", resp)
+	}
+}
+
 func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-chan *Participant, <-chan error) {
 	ch := make(chan *Participant)
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 
 	var peerToAct, err = c.ResolvePeer(chatID)
 	if err != nil {
 		errCh <- err
 		close(ch)
+		close(errCh)
 		return ch, errCh
 	}
 
@@ -326,6 +356,7 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 	if !ok {
 		errCh <- fmt.Errorf("peer is not a channel, but %T", peerToAct)
 		close(ch)
+		close(errCh)
 		return ch, errCh
 	}
 
@@ -362,7 +393,6 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 					errCh <- err
 					return
 				}
-
 				switch resp := resp.(type) {
 				case *ChannelsChannelParticipantsObj:
 					if resp.Count == 0 {
@@ -370,16 +400,20 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 					}
 					opts.Limit = resp.Count
 				case *ChannelsChannelParticipantsNotModified:
+					return
 				default:
+					errCh <- fmt.Errorf("unexpected participants response: %T", resp)
+					return
 				}
-
 				continue
 			}
 
-			remaining := opts.Limit - int32(fetched)
 			perReqLimit := int32(200)
-			if remaining < perReqLimit {
-				perReqLimit = remaining
+			if opts.Limit > 0 {
+				remaining := opts.Limit - int32(fetched)
+				if remaining < perReqLimit {
+					perReqLimit = remaining
+				}
 			}
 			req.Limit = perReqLimit
 

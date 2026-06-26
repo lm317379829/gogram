@@ -936,6 +936,7 @@ func (c *Client) QRLogin(options ...QrOptions) (*QrToken, error) {
 			return nil, err
 		}
 		return c.QRLogin(options...)
+
 	case *AuthLoginTokenSuccess:
 		switch u := qr.Authorization.(type) {
 		case *AuthAuthorizationObj:

@@ -80,12 +80,22 @@ func (c *Client) AnswerCallbackQuery(QueryID int64, Text string, Opts ...*Callba
 
 // BOT COMMANDS
 
-func (c *Client) SetBotCommands(commands []*BotCommand, peer *InputPeer, languageCode ...string) (bool, error) {
+func (c *Client) SetBotCommands(commands []*BotCommand, target any, languageCode ...string) (bool, error) {
 	var scope BotCommandScope = &BotCommandScopeDefault{}
-	if peer != nil {
-		scope = &BotCommandScopePeer{
-			Peer: *peer,
+	switch v := target.(type) {
+	case nil:
+	case BotCommandScope:
+		scope = v
+	case *BotCommandScope:
+		if v != nil {
+			scope = *v
 		}
+	case *InputPeer:
+		if v != nil {
+			scope = &BotCommandScopePeer{Peer: *v}
+		}
+	default:
+		return false, fmt.Errorf("unsupported bot command target: %T", target)
 	}
 
 	resp, err := c.BotsSetBotCommands(scope, getVariadic(languageCode, ""), commands)
