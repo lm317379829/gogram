@@ -5,7 +5,6 @@ package telegram
 import (
 	"fmt"
 	"math"
-	"reflect"
 	"time"
 
 	"errors"
@@ -386,37 +385,22 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 		}
 
 		for {
-			if opts.Limit == -1 {
-				req.Limit = 0
-				resp, err := c.MakeRequest(req)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				switch resp := resp.(type) {
-				case *ChannelsChannelParticipantsObj:
-					if resp.Count == 0 {
-						return
-					}
-					opts.Limit = resp.Count
-				case *ChannelsChannelParticipantsNotModified:
-					return
-				default:
-					errCh <- fmt.Errorf("unexpected participants response: %T", resp)
-					return
-				}
-				continue
-			}
-
 			perReqLimit := int32(200)
-			if opts.Limit > 0 {
-				remaining := opts.Limit - int32(fetched)
-				if remaining < perReqLimit {
-					perReqLimit = remaining
-				}
-			}
-			req.Limit = perReqLimit
 
+			// 1. 设置本次请求的 Limit
+			if opts.Limit == -1 {
+				req.Limit = 0 // 探测总数的特殊请求
+			} else {
+				if opts.Limit > 0 {
+					remaining := opts.Limit - int32(fetched)
+					if remaining < perReqLimit {
+						perReqLimit = remaining
+					}
+				}
+				req.Limit = perReqLimit
+			}
+
+			// 2. 统一发起请求与处理错误
 			resp, err := c.MakeRequest(req)
 			if err != nil {
 				if handleIfFlood(err, c) {
@@ -436,8 +420,19 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 				return
 			}
 
+			// 3. 统一处理响应
 			switch resp := resp.(type) {
 			case *ChannelsChannelParticipantsObj:
+				if opts.Limit == -1 {
+					// 探测请求：拿到总数后更新 Limit 并直接进行下一次拉取
+					if resp.Count == 0 {
+						return
+					}
+					opts.Limit = resp.Count
+					continue
+				}
+
+				// 正式拉取请求：处理数据
 				c.Cache.UpdatePeersToCache(resp.Users, resp.Chats)
 				for _, p := range resp.Participants {
 					part, err := c.processParticipant(p)
@@ -453,8 +448,10 @@ func (c *Client) IterChatMembers(chatID any, Opts ...*ParticipantOptions) (<-cha
 				}
 
 				req.Offset = fetched
+			case *ChannelsChannelParticipantsNotModified:
+				return
 			default:
-				errCh <- errors.New("unexpected response: " + reflect.TypeOf(resp).String())
+				errCh <- fmt.Errorf("unexpected participants response: %T", resp)
 				return
 			}
 
