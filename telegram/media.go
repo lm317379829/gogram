@@ -1051,13 +1051,11 @@ type downloadJob struct {
 	log                    *partLogAggregator
 	precise                bool
 	requestTimeoutOverride time.Duration
-
-	cdnMu    sync.Mutex
-	cdn      *cdnRedirect
-	cdnPools map[int32]*WorkerPool
-
-	resume       *resumeState
-	resumeStopCh chan struct{}
+	cdnMu                  sync.Mutex
+	cdn                    *cdnRedirect
+	cdnPools               map[int32]*WorkerPool
+	resume                 *resumeState
+	resumeStopCh           chan struct{}
 }
 
 type cdnRedirect struct {
@@ -1802,7 +1800,9 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 		return nil, "", errors.New("start offset must be non-negative")
 	}
 	if end <= start {
-		_, _, _, name, err := GetFileLocation(media)
+		err := errors.New("end offset must be greater than start offset")
+		_, _, _, name, value := GetFileLocation(media)
+		err = errors.Join(err, value)
 		return []byte{}, name, err
 	}
 
@@ -1810,6 +1810,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	if err != nil {
 		return nil, "", err
 	}
+
 	if dc == 0 {
 		dc = int32(c.GetDC())
 	}
@@ -1832,34 +1833,6 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 			return nil, "", fmt.Errorf("download chunk option must be bool, context.Context, or time.Duration, got %T", value)
 		}
 	}
-	/*
-	if len(opts) > 0 {
-		if v, ok := opts[0].(bool); ok {
-			precise = v
-		} else {
-			return nil, "", fmt.Errorf("download chunk precise option must be bool, got %T", opts[0])
-		}
-	}
-	if len(opts) > 1 {
-		if opts[1] != nil {
-			if v, ok := opts[1].(context.Context); ok {
-				baseCtx = v
-			} else {
-				return nil, "", fmt.Errorf("download chunk context option must be context.Context, got %T", opts[1])
-			}
-		}
-	}
-	if len(opts) > 2 {
-		if v, ok := opts[2].(time.Duration); ok {
-			requestTimeout = v
-		} else {
-			return nil, "", fmt.Errorf("download chunk timeout option must be time.Duration, got %T", opts[2])
-		}
-	}
-	if len(opts) > 3 {
-		return nil, "", fmt.Errorf("too many download chunk options: %d", len(opts))
-	}
-	*/
 
 	job := &downloadJob{
 		client:                 c,
@@ -1871,7 +1844,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 		partSize:               chunkSize,
 		workers:                1,
 		ctx:                    baseCtx,
-		log:                    newPartLogAggregator("download_chunk", 0, 3*time.Second, c.Log),
+		log:                    newPartLogAggregator("downloadChunk", 0, 3*time.Second, c.Log),
 		precise:                precise,
 		requestTimeoutOverride: requestTimeout,
 	}
@@ -1889,9 +1862,6 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	var buf []byte
 	for index, offset := 0, int64(start); offset < int64(end); index++ {
 		limit := chunkSize
-		if remaining := int64(end) - offset; remaining < int64(limit) {
-			limit = int(remaining)
-		}
 		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: offset, limit: limit})
 		if err != nil {
 			return nil, "", err
@@ -1900,7 +1870,14 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 			tl.ReleaseLargeBuffer(result.data)
 			break
 		}
-		buf = append(buf, result.data...)
+
+		data := result.data
+		remaining := int64(end) - offset
+		if int64(len(data)) > remaining {
+			data = data[:remaining]
+		}
+
+		buf = append(buf, data...)
 		n := len(result.data)
 		tl.ReleaseLargeBuffer(result.data)
 		offset += int64(n)
