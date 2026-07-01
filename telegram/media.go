@@ -1821,6 +1821,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	precise := false
 	baseCtx := context.Background()
 	var requestTimeout time.Duration
+	var externalPool *WorkerPool
 	for _, opt := range opts {
 		switch value := opt.(type) {
 		case bool:
@@ -1829,8 +1830,10 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 			baseCtx = value
 		case time.Duration:
 			requestTimeout = value
+		case *WorkerPool:
+			externalPool = value
 		default:
-			return nil, "", fmt.Errorf("download chunk option must be bool, context.Context, or time.Duration, got %T", value)
+			return nil, "", fmt.Errorf("unsupported DownloadChunk option type: %T", value)
 		}
 	}
 
@@ -1850,13 +1853,19 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	}
 	defer job.log.Flush()
 
-	pool := NewWorkerPool(1)
-	defer pool.Close()
-	if err := initializeWorkers(1, dc, c, pool); err != nil {
-		return nil, "", err
-	}
-	if !pool.WaitReady(job.ctx) {
-		return nil, "", errors.New("failed to initialize worker")
+	var pool *WorkerPool
+	if externalPool != nil {
+		// 使用调用方提供的长连接池，跳过建连开销，生命周期由调用方管理
+		pool = externalPool
+	} else {
+		pool = NewWorkerPool(1)
+		defer pool.Close()
+		if err := initializeWorkers(1, dc, c, pool); err != nil {
+			return nil, "", err
+		}
+		if !pool.WaitReady(job.ctx) {
+			return nil, "", errors.New("failed to initialize worker")
+		}
 	}
 
 	var buf []byte
@@ -1887,6 +1896,27 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	}
 
 	return buf, name, nil
+}
+
+// NewDownloadPool 为指定 DC 创建并初始化一个可复用的 WorkerPool。
+// dc=0 时自动使用客户端所在 DC。
+// 调用方负责在不再需要时调用 pool.Close() 释放 pool 包装（不影响底层 TCP 连接）。
+func (c *Client) NewDownloadPool(dc int32) (*WorkerPool, error) {
+	if dc == 0 {
+		dc = int32(c.GetDC())
+	}
+	pool := NewWorkerPool(1)
+	if err := initializeWorkers(1, dc, c, pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("initialize download pool for DC%d: %w", dc, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if !pool.WaitReady(ctx) {
+		pool.Close()
+		return nil, fmt.Errorf("timeout waiting for download pool worker (DC%d)", dc)
+	}
+	return pool, nil
 }
 
 // ----------------------- Helper Functions -----------------------
