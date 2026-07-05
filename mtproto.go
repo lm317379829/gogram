@@ -135,7 +135,7 @@ type MTProto struct {
 	Logger *utils.Logger
 
 	serverRequestHandlers []func(i any) bool
-	floodHandler          func(err error) bool
+	floodHandler          func(ctx context.Context, err error) bool
 	errorHandler          func(err error) bool
 	connectionHandler     func(err error) error
 	exported              bool
@@ -167,7 +167,7 @@ type Config struct {
 	AppID          int32                 // Telegram API ID
 	EnablePFS      bool                  // Enable Perfect Forward Secrecy
 
-	FloodHandler      func(err error) bool  // Called on FLOOD_WAIT; return true to retry
+	FloodHandler      func(ctx context.Context, err error) bool  // Called on FLOOD_WAIT; return true to retry
 	ErrorHandler      func(err error) bool  // Called on errors; return true to retry
 	ConnectionHandler func(err error) error // Custom reconnection handler
 
@@ -242,7 +242,7 @@ func NewMTProto(c Config) (*MTProto, error) {
 		appID:                 c.AppID,
 		proxy:                 c.Proxy,
 		localAddr:             c.LocalAddr,
-		floodHandler:          func(err error) bool { return false },
+		floodHandler:          func(ctx context.Context, err error) bool { return false },
 		errorHandler:          func(err error) bool { return false },
 		reqTimeout:            utils.MinSafeDuration(c.ReqTimeout),
 		mode:                  parseTransportMode(c.Mode),
@@ -952,7 +952,7 @@ func (m *MTProto) makeRequestCtxWithDepth(ctx context.Context, data tl.Object, r
 				}
 			}
 		}
-		return m.handleRPCResult(data, resp, expectedTypes...)
+		return m.handleRPCResult(ctx, data, resp, expectedTypes...)
 	}
 }
 
@@ -960,7 +960,7 @@ func (m *MTProto) shouldRetryError(err error) bool {
 	return m.errorHandler != nil && m.errorHandler(err)
 }
 
-func (m *MTProto) handleRPCResult(data tl.Object, response tl.Object, expectedTypes ...reflect.Type) (any, error) {
+func (m *MTProto) handleRPCResult(ctx context.Context, data tl.Object, response tl.Object, expectedTypes ...reflect.Type) (any, error) {
 	switch r := response.(type) {
 	case *objects.RpcError:
 		var rpcError *ErrResponseCode
@@ -985,7 +985,7 @@ func (m *MTProto) handleRPCResult(data tl.Object, response tl.Object, expectedTy
 
 		// handle flood wait errors (code 420)
 		if strings.Contains(rpcError.Message, "FLOOD_WAIT_") || strings.Contains(rpcError.Message, "FLOOD_PREMIUM_WAIT_") {
-			if m.floodHandler(rpcError) {
+			if m.floodHandler(ctx, rpcError) {
 				ctx, cancel := context.WithTimeout(context.Background(), m.reqTimeout)
 				defer cancel()
 				return m.makeRequestCtx(ctx, data, expectedTypes...)

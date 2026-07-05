@@ -127,7 +127,7 @@ type ClientConfig struct {
 	SleepThresholdMs int                  // Auto-sleep threshold for flood wait (ms)
 	AlbumWaitTime    int64                // Time to wait for grouped album messages (ms)
 	CommandPrefixes  string               // Bot command prefixes (default: "/!")
-	FloodHandler     func(err error) bool // Called on FLOOD_WAIT; return true to retry after wait
+	FloodHandler     func(ctx context.Context, err error) bool // Called on FLOOD_WAIT; return true to retry after wait
 	ErrorHandler     func(err error) bool // Called on request errors; return true to retry
 	Timeout          int                  // TCP connection timeout in seconds (default: 60)
 	ReqTimeout       int                  // RPC request timeout in seconds (default: 60)
@@ -1095,7 +1095,7 @@ func (b *ClientConfigBuilder) WithSleepThresholdMs(threshold int) *ClientConfigB
 	return b
 }
 
-func (b *ClientConfigBuilder) WithFloodHandler(handler func(err error) bool) *ClientConfigBuilder {
+func (b *ClientConfigBuilder) WithFloodHandler(handler func(ctx context.Context, err error) bool) *ClientConfigBuilder {
 	b.config.FloodHandler = handler
 	return b
 }
