@@ -61,6 +61,11 @@ func (wp *WorkerPool) AddWorker(s *ExSender) {
 	}
 }
 
+// ErrWorkerTCPDead is returned when the connection pool worker's TCP link is
+// detected as dead AND the caller's context is cancelled before reconnect finishes.
+// Callers can use errors.Is(err, ErrWorkerTCPDead) to detect this condition.
+var ErrWorkerTCPDead = errors.New("worker TCP link dead")
+
 func (wp *WorkerPool) Next() *ExSender {
 	return wp.NextWithContext(context.Background())
 }
@@ -69,7 +74,23 @@ func (wp *WorkerPool) NextWithContext(ctx context.Context) *ExSender {
 	select {
 	case next := <-wp.free:
 		if !next.MTProto.IsTcpActive() {
-			_ = next.Reconnect(false)
+			done := make(chan struct{})
+			go func() {
+				_ = next.Reconnect(false)
+				close(done)
+			}()
+			select {
+			case <-done:
+				// Reconnect finished; caller's MakeRequestCtx will detect actual state.
+			case <-ctx.Done():
+				// TCP link is dead and caller gave up.
+				// Let the reconnect goroutine finish then return worker to pool.
+				go func() {
+					<-done
+					wp.free <- next
+				}()
+				return nil
+			}
 		}
 
 		next.lastUsedMu.Lock()
@@ -1410,6 +1431,10 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 			return result, nil
 		}
 		lastErr = err
+		// TCP-dead is a special fatal condition — propagate immediately, no retry.
+		if errors.Is(err, ErrWorkerTCPDead) {
+			return downloadResult{}, err
+		}
 		failure := j.classifyError(ctx, err)
 		if failure.kind == downloadErrFatal || failure.kind == downloadErrContext {
 			return downloadResult{}, failure.err
@@ -1434,6 +1459,19 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 
 	sender := pool.NextWithContext(reqCtx)
 	if sender == nil {
+		// Distinguish: was this a TCP-dead timeout vs ordinary context cancel?
+		pool.Lock()
+		allDead := len(pool.workers) > 0
+		for _, w := range pool.workers {
+			if w.MTProto.IsTcpActive() {
+				allDead = false
+				break
+			}
+		}
+		pool.Unlock()
+		if allDead {
+			return downloadResult{}, ErrWorkerTCPDead
+		}
 		return downloadResult{}, contextErr(reqCtx, errors.New("failed to acquire download worker"))
 	}
 	defer pool.FreeWorker(sender)
