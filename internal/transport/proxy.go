@@ -47,7 +47,7 @@ func dialHTTP(s *url.URL, targetAddr string, localAddr string) (net.Conn, error)
 
 	passwd, _ := s.User.Password()
 
-	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", s.User.Username(), passwd)))
+	auth := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%s:%s", s.User.Username(), passwd))
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nProxy-Authorization: Basic %s\r\n\r\n", targetAddr, auth)
 	_, err = conn.Write([]byte(connectReq))
 	if err != nil {

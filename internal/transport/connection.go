@@ -36,36 +36,26 @@ func NewTCP(cfg TCPConnConfig) (Conn, bool, error) {
 
 	cfg.Host = strings.TrimPrefix(cfg.Host, ":")
 
-	tcpAddr, err := net.ResolveTCPAddr(tcpPrefix, cfg.Host)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolving tcp addr: %w", err)
+	dialer := net.Dialer{
+		Timeout:   cfg.Timeout,
+		KeepAlive: 30 * time.Second,
 	}
-
-	// Resolve a local address if provided
-	var localAddr *net.TCPAddr
 	if cfg.LocalAddr != "" {
-		localAddr, err = net.ResolveTCPAddr(tcpPrefix, cfg.LocalAddr)
+		localAddr, err := net.ResolveTCPAddr(tcpPrefix, cfg.LocalAddr)
 		if err != nil {
 			return nil, false, fmt.Errorf("resolving local tcp addr: %w", err)
 		}
+		dialer.LocalAddr = localAddr
 	}
 
-	conn, err := net.DialTCP(tcpPrefix, localAddr, tcpAddr)
-	// if there is a timeout error, wait 2 secs and retry (only once)
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		time.Sleep(2 * time.Second)
-		conn, err = net.DialTCP(tcpPrefix, localAddr, tcpAddr)
-	}
-
+	rawConn, err := dialer.DialContext(cfg.Ctx, tcpPrefix, cfg.Host)
 	if err != nil {
 		if cfg.Logger != nil {
 			cfg.Logger.WithError(err).Debug("[tcp] connection failed")
 		}
 		return nil, false, fmt.Errorf("dialing tcp: %w", err)
 	}
-
-	conn.SetKeepAlive(true)
-	conn.SetKeepAlivePeriod(30 * time.Second)
+	conn := rawConn.(*net.TCPConn)
 
 	if cfg.Logger != nil {
 		cfg.Logger.Trace("[tcp] connected to %s", cfg.Host)

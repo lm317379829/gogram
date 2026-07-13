@@ -83,11 +83,13 @@ func (wp *WorkerPool) NextWithContext(ctx context.Context) *ExSender {
 			case <-done:
 				// Reconnect finished; caller's MakeRequestCtx will detect actual state.
 			case <-ctx.Done():
-				// TCP link is dead and caller gave up.
-				// Let the reconnect goroutine finish then return worker to pool.
+				// Caller gave up. Wait for reconnect to finish, then only
+				// return worker to pool if it's actually active again.
 				go func() {
 					<-done
-					wp.free <- next
+					if next.MTProto.IsTcpActive() {
+						wp.free <- next
+					}
 				}()
 				return nil
 			}
