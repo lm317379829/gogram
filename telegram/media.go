@@ -1612,29 +1612,20 @@ func (j *downloadJob) activateCDN(r *UploadFileCdnRedirect) error {
 
 func (j *downloadJob) cdnPool(_ context.Context, dc int32) (*WorkerPool, error) {
 	j.cdnMu.Lock()
+	defer j.cdnMu.Unlock()
 	if j.cdnPools == nil {
 		j.cdnPools = make(map[int32]*WorkerPool)
 	}
 	if pool, ok := j.cdnPools[dc]; ok {
-		j.cdnMu.Unlock()
 		return pool, nil
 	}
-	j.cdnMu.Unlock()
-
 	conn, err := j.client.CreateExportedSender(int(dc), true, false)
 	if err != nil {
 		return nil, fmt.Errorf("creating cdn sender: %w", err)
 	}
 	pool := NewWorkerPool(1)
 	pool.AddWorker(NewExSender(conn))
-
-	j.cdnMu.Lock()
-	if existing, ok := j.cdnPools[dc]; ok {
-		j.cdnMu.Unlock()
-		return existing, nil
-	}
 	j.cdnPools[dc] = pool
-	j.cdnMu.Unlock()
 	return pool, nil
 }
 

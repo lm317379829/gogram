@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -570,6 +571,13 @@ func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, er
 	sender.exported = true
 	if isCdn {
 		sender.cdn = true
+		m.cdnKeysMu.RLock()
+		if len(m.cdnKeys) > 0 {
+			inherited := make(map[int32]*rsa.PublicKey, len(m.cdnKeys))
+			maps.Copy(inherited, m.cdnKeys)
+			sender.cdnKeys = inherited
+		}
+		m.cdnKeysMu.RUnlock()
 	}
 
 	if err := sender.CreateConnection(false); err != nil {

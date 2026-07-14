@@ -46,6 +46,20 @@ func (*PQInnerData) CRC() uint32 {
 	return 0x83c95aec
 }
 
+type PQInnerDataDc struct {
+	Pq          []byte
+	P           []byte
+	Q           []byte
+	Nonce       *tl.Int128
+	ServerNonce *tl.Int128
+	NewNonce    *tl.Int256
+	Dc          int32
+}
+
+func (*PQInnerDataDc) CRC() uint32 {
+	return 0xa9f55f95
+}
+
 // PQInnerDataTempDc represents p_q_inner_data_temp_dc used for generating
 // temporary authorization keys (PFS) as described in MTProto auth_key docs.
 func (*PQInnerDataTempDc) CRC() uint32 {

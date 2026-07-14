@@ -670,13 +670,16 @@ func convertBlockquoteSyntax(markdown string) string {
 		switch {
 		case strings.HasPrefix(trimmed, ">> "):
 			openBlockquote(true)
-			result.WriteString(trimmed[3:] + "\n")
+			result.WriteString(trimmed[3:])
+			result.WriteString("\n")
 		case strings.HasPrefix(trimmed, "> "):
 			openBlockquote(false)
-			result.WriteString(trimmed[2:] + "\n")
+			result.WriteString(trimmed[2:])
+			result.WriteString("\n")
 		default:
 			closeBlockquote()
-			result.WriteString(line + "\n")
+			result.WriteString(line)
+			result.WriteString("\n")
 		}
 	}
 	closeBlockquote()

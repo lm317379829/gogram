@@ -17,6 +17,7 @@ func init() {
 		&GetFutureSaltsParams{},
 		&ResPQ{},
 		&PQInnerData{},
+		&PQInnerDataDc{},
 		&PQInnerDataTempDc{},
 		&ServerDHParamsFail{},
 		&ServerDHParamsOk{},

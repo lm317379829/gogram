@@ -198,6 +198,20 @@ func (opt *DCOptions) SearchAddr(addr string) int {
 			}
 		}
 	}
+	for dcID, addrs := range opt.CDNDCs {
+		for _, dc := range addrs {
+			if dc.Addr == addr {
+				return dcID
+			}
+		}
+	}
+	for dcID, addrs := range opt.MediaDCs {
+		for _, dc := range addrs {
+			if dc.Addr == addr {
+				return dcID
+			}
+		}
+	}
 
 	switch {
 	case strings.Contains(addr, "91.108.56"):

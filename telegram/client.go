@@ -221,21 +221,21 @@ func (c *Client) setupMTProto(config ClientConfig) error {
 		Logger: c.Log.CloneInternal().
 			WithPrefix("gogram " +
 				lp("mtproto", config.SessionName)),
-		StringSession:   config.StringSession,
-		LocalAddr:       config.LocalAddr,
-		MemorySession:   config.MemorySession,
-		Ipv6:            config.ForceIPv6,
-		CustomHost:      customHost,
-		FloodHandler:    config.FloodHandler,
-		ErrorHandler:    config.ErrorHandler,
-		Timeout:         config.Timeout,
-		ReqTimeout:      config.ReqTimeout,
-		Transport:       config.Transport,
-		Mode:            string(config.TransportMode),
-		Obfuscated:      config.Obfuscated,
-		HTTPPath:        config.HTTPPath,
-		EnablePFS:       config.EnablePFS,
-		PFSKeyLifetime:  config.PFSKeyLifetime,
+		StringSession:  config.StringSession,
+		LocalAddr:      config.LocalAddr,
+		MemorySession:  config.MemorySession,
+		Ipv6:           config.ForceIPv6,
+		CustomHost:     customHost,
+		FloodHandler:   config.FloodHandler,
+		ErrorHandler:   config.ErrorHandler,
+		Timeout:        config.Timeout,
+		ReqTimeout:     config.ReqTimeout,
+		Transport:      config.Transport,
+		Mode:           string(config.TransportMode),
+		Obfuscated:     config.Obfuscated,
+		HTTPPath:       config.HTTPPath,
+		EnablePFS:      config.EnablePFS,
+		PFSKeyLifetime: config.PFSKeyLifetime,
 		OnMigration: func() {
 			c.InitialRequest()
 		},
@@ -709,18 +709,22 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 
 	var authParam = getVariadic(authParams, &AuthExportedAuthorization{})
 
-	c.Log.Debug("creating exported sender (DC%d)", dcID)
+	c.Log.Debug("creating exported sender (DC%d, cdn=%v, media=%v)", dcID, cdn, media)
 	if cdn {
 		if _, has := c.MTProto.HasCdnKey(int32(dcID)); !has {
 			cdnKeysResp, err := c.HelpGetCdnConfig()
 			if err != nil {
 				return nil, fmt.Errorf("getting cdn config: %w", err)
 			}
-
 			var cdnKeys = make(map[int32]*rsa.PublicKey)
 			for _, key := range cdnKeysResp.PublicKeys {
-				cdnKeys[key.DcID], _ = keys.ParsePublicKey(key.PublicKey)
+				parsed, perr := keys.ParsePublicKey(key.PublicKey)
+				if perr != nil {
+					continue
+				}
+				cdnKeys[key.DcID] = parsed
 			}
+			c.MTProto.SetCdnKeys(cdnKeys)
 		}
 	}
 
@@ -737,6 +741,11 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 			exported.Terminate()
 		}
 	}()
+
+	// no need invokeWithLayer for CDN DCs.
+	if cdn {
+		return exported, nil
+	}
 
 	for retry := 0; retry <= retryLimit; retry++ {
 		initialReq := &InitConnectionParams{
@@ -1082,9 +1091,9 @@ func NewClientConfigBuilder(appID int32, appHash string) *ClientConfigBuilder {
 				SystemVersion: "iOS 26.0",
 				AppVersion:    Version,
 			},
-			DataCenter:    4,          // Default DC
-			ParseMode:     "HTML",     // Default parse mode
-			LogLevel:      InfoLevel,  // Default log level
+			DataCenter:    4,         // Default DC
+			ParseMode:     "HTML",    // Default parse mode
+			LogLevel:      InfoLevel, // Default log level
 			TransportMode: TransportModeAbridged,
 		},
 	}
