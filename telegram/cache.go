@@ -116,6 +116,9 @@ type CACHE struct {
 	binded      bool
 	storage     CacheStorage
 
+	minChannels map[int64]int64
+	minUsers    map[int64]int64
+
 	mediaCache   map[string]*CachedMedia
 	mediaCacheMu sync.RWMutex
 
@@ -123,6 +126,10 @@ type CACHE struct {
 	writePending  atomic.Bool
 	lastWrite     time.Time
 	writeMu       sync.Mutex
+
+	lruUsers    map[int64]int64
+	lruChannels map[int64]int64
+	lruCounter  int64
 }
 
 type CachedMedia struct {
@@ -168,6 +175,13 @@ func (c *CACHE) resetLocked() {
 	c.channels = make(map[int64]*Channel)
 	c.usernameMap = make(map[string]int64)
 	c.InputPeers = newInputPeerCache()
+	c.minChannels = make(map[int64]int64)
+	c.minUsers = make(map[int64]int64)
+	if c.maxSize > 0 {
+		c.lruUsers = make(map[int64]int64)
+		c.lruChannels = make(map[int64]int64)
+		c.lruCounter = 0
+	}
 }
 
 func (c *CACHE) fileNameForUser(userID int64) string {
@@ -249,36 +263,13 @@ func (c *CACHE) snapshotInputPeers() *InputPeerCache {
 }
 
 func (c *CACHE) BindToUser(userID int64) error {
-	if c == nil || c.disabled || c.memory {
-		return nil
-	}
-
-	// Allow binding with 0 initially (loads base cache file)
-	// Later RebindToUser will be called with actual user ID
-	if userID == 0 {
-		if c.binded {
-			return nil // Already bound to something
-		}
-		c.binded = true
-		c.Lock()
-		defer c.Unlock()
-		// Try to load base cache file if it exists
-		if c.fileName != "" {
-			if err := c.loadFileIntoLocked(c.fileName, 0); err != nil {
-				if !os.IsNotExist(err) {
-					c.logger.WithError(err).Debug("base cache load failed")
-				} else {
-					c.logger.Debug("base cache missing, starting empty")
-				}
-			}
-		}
+	if c == nil || c.disabled || c.memory || userID == 0 {
 		return nil
 	}
 
 	if c.binded {
-		return nil // Already bound
+		return nil
 	}
-
 	c.binded = true
 
 	target := c.fileNameForUser(userID)
@@ -290,18 +281,15 @@ func (c *CACHE) BindToUser(userID int64) error {
 	defer c.Unlock()
 
 	if target != "" && c.fileName != target {
-		// Update storage path for file-based storage
 		if fStorage, ok := c.storage.(*FileCacheStorage); ok {
 			fStorage.SetPath(target)
 		}
 
 		if err := c.loadFileIntoLocked(target, userID); err != nil {
 			if os.IsNotExist(err) {
-				// No cache file for this user yet, start fresh
 				c.logger.Debug("cache missing (user %d), starting fresh", userID)
 				c.resetLocked()
 			} else if strings.Contains(err.Error(), "owner mismatch") {
-				// Owner mismatch detected during load - don't use this cache
 				c.logger.WithError(err).Warn("cache owner mismatch detected, starting fresh cache")
 				c.resetLocked()
 			} else {
@@ -322,81 +310,10 @@ func (c *CACHE) BindToUser(userID int64) error {
 			}).Warn("cache owner mismatch after load, clearing cache")
 			c.resetLocked()
 		} else {
-			// Valid cache for this user
 			return nil
 		}
 	}
 
-	c.ensureInputPeersLocked()
-	c.InputPeers.OwnerID = userID
-	return nil
-}
-
-// RebindToUser rebinds the cache to a different user ID
-// Used when actual user ID is discovered after initial binding with 0
-func (c *CACHE) RebindToUser(userID int64) error {
-	if c == nil || c.disabled || c.memory || userID == 0 {
-		return nil
-	}
-
-	c.Lock()
-	defer c.Unlock()
-
-	currentOwner := c.InputPeers.OwnerID
-	if currentOwner == userID {
-		return nil
-	}
-
-	if currentOwner == 0 {
-		c.logger.WithFields(map[string]any{
-			"users":      len(c.InputPeers.InputUsers),
-			"channels":   len(c.InputPeers.InputChannels),
-			"usernames":  len(c.usernameMap),
-			"cache_file": c.fileName,
-		}).Debug("adopting unbound cache (user %d)", userID)
-		c.ensureInputPeersLocked()
-		c.InputPeers.OwnerID = userID
-		return nil
-	}
-
-	if currentOwner != userID {
-		c.logger.WithFields(map[string]any{
-			"old_owner": currentOwner,
-			"new_owner": userID,
-		}).Info("cache owner changed, rebinding...")
-		c.resetLocked()
-	}
-
-	// Load user-specific cache file
-	target := c.fileNameForUser(userID)
-	if target == "" {
-		target = c.fileName
-	}
-
-	if target != c.fileName {
-		// Update storage path for file-based storage
-		if fStorage, ok := c.storage.(*FileCacheStorage); ok {
-			fStorage.SetPath(target)
-		}
-
-		if err := c.loadFileIntoLocked(target, userID); err != nil {
-			if os.IsNotExist(err) {
-				c.logger.Debug("no existing cache for user %d, starting fresh", userID)
-			} else if strings.Contains(err.Error(), "owner mismatch") {
-				c.logger.WithError(err).Warn("cache owner mismatch during rebind, starting fresh")
-				c.resetLocked()
-			} else {
-				c.logger.WithError(err).Warn("failed to load cache during rebind, starting fresh")
-				c.resetLocked()
-			}
-		} else {
-			c.logger.Debug("user cache loaded: %s", target)
-		}
-		c.fileName = target
-		c.logger.Debug("cache rebound (user %d): %s", userID, target)
-	}
-
-	// Set owner ID
 	c.ensureInputPeersLocked()
 	c.InputPeers.OwnerID = userID
 	return nil
@@ -412,11 +329,7 @@ func (c *CACHE) Clear() {
 	defer c.Unlock()
 
 	ownerID := c.InputPeers.OwnerID
-	c.chats = make(map[int64]*ChatObj)
-	c.users = make(map[int64]*UserObj)
-	c.channels = make(map[int64]*Channel)
-	c.usernameMap = make(map[string]int64)
-	c.InputPeers = newInputPeerCache()
+	c.resetLocked()
 	c.InputPeers.OwnerID = ownerID
 }
 
@@ -460,6 +373,8 @@ func NewCache(fileName string, opts ...*CacheConfig) *CACHE {
 		channels:    make(map[int64]*Channel),
 		usernameMap: make(map[string]int64),
 		InputPeers:  newInputPeerCache(),
+		minChannels: make(map[int64]int64),
+		minUsers:    make(map[int64]int64),
 		mediaCache:  make(map[string]*CachedMedia),
 		memory:      opt.Memory,
 		disabled:    opt.Disabled,
@@ -469,6 +384,10 @@ func NewCache(fileName string, opts ...*CacheConfig) *CACHE {
 				lp("cache", opt.LogName)).
 				SetColor(opt.LogColor).
 				SetLevel(opt.LogLevel)),
+	}
+	if opt.MaxSize > 0 {
+		c.lruUsers = make(map[int64]int64)
+		c.lruChannels = make(map[int64]int64)
 	}
 
 	if opt.Storage != nil {
@@ -496,11 +415,27 @@ func (c *CACHE) Disable() *CACHE {
 	return c
 }
 
-// enforceSizeLimit removes oldest entries if cache exceeds maxSize
-// Must be called while holding write lock
+func (c *CACHE) touchUserLRU(userID int64) {
+	if c.maxSize <= 0 {
+		return
+	}
+	c.lruCounter++
+	c.lruUsers[userID] = c.lruCounter
+}
+
+func (c *CACHE) touchChannelLRU(channelID int64) {
+	if c.maxSize <= 0 {
+		return
+	}
+	c.lruCounter++
+	c.lruChannels[channelID] = c.lruCounter
+}
+
+// enforceSizeLimit evicts least-recently-touched entries when the cache
+// exceeds maxSize. Must be called while holding the write lock.
 func (c *CACHE) enforceSizeLimit() {
 	if c.maxSize <= 0 {
-		return // unlimited
+		return
 	}
 
 	totalSize := len(c.InputPeers.InputUsers) + len(c.InputPeers.InputChannels)
@@ -511,38 +446,46 @@ func (c *CACHE) enforceSizeLimit() {
 	excess := totalSize - c.maxSize
 	removed := 0
 
-	// Remove oldest users first (simple strategy: remove arbitrary entries)
-	for userID := range c.InputPeers.InputUsers {
+	type entry struct {
+		id      int64
+		touched int64
+		isChan  bool
+	}
+	victims := make([]entry, 0, excess*2)
+	for id := range c.InputPeers.InputUsers {
+		victims = append(victims, entry{id: id, touched: c.lruUsers[id]})
+	}
+	for id := range c.InputPeers.InputChannels {
+		victims = append(victims, entry{id: id, touched: c.lruChannels[id], isChan: true})
+	}
+	sort.Slice(victims, func(i, j int) bool { return victims[i].touched < victims[j].touched })
+
+	for _, v := range victims {
 		if removed >= excess {
 			break
 		}
-		delete(c.InputPeers.InputUsers, userID)
-		if user, ok := c.users[userID]; ok {
-			// Clean up username mapping
-			if user.Username != "" {
-				delete(c.usernameMap, user.Username)
+		if v.isChan {
+			delete(c.InputPeers.InputChannels, v.id)
+			delete(c.lruChannels, v.id)
+			if ch, ok := c.channels[v.id]; ok {
+				if ch.Username != "" {
+					delete(c.usernameMap, ch.Username)
+				}
+				delete(c.channels, v.id)
 			}
-			delete(c.users, userID)
+			delete(c.minChannels, v.id)
+		} else {
+			delete(c.InputPeers.InputUsers, v.id)
+			delete(c.lruUsers, v.id)
+			if u, ok := c.users[v.id]; ok {
+				if u.Username != "" {
+					delete(c.usernameMap, u.Username)
+				}
+				delete(c.users, v.id)
+			}
+			delete(c.minUsers, v.id)
 		}
 		removed++
-	}
-
-	// If still need to remove more, remove channels
-	if removed < excess {
-		for channelID := range c.InputPeers.InputChannels {
-			if removed >= excess {
-				break
-			}
-			delete(c.InputPeers.InputChannels, channelID)
-			if channel, ok := c.channels[channelID]; ok {
-				// Clean up username mapping
-				if channel.Username != "" {
-					delete(c.usernameMap, channel.Username)
-				}
-				delete(c.channels, channelID)
-			}
-			removed++
-		}
 	}
 
 	if removed > 0 {
@@ -553,14 +496,18 @@ func (c *CACHE) enforceSizeLimit() {
 // --------- Cache file Functions ---------
 func (c *CACHE) WriteFile() {
 	if c.disabled || c.memory {
+		c.writePending.Store(false)
 		return
 	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	// debounce: don't write if we wrote recently
-	if time.Since(c.lastWrite) < 2*time.Second {
+	if wait := 2*time.Second - time.Since(c.lastWrite); wait > 0 {
+		go func(d time.Duration) {
+			time.Sleep(d)
+			c.WriteFile()
+		}(wait)
 		return
 	}
 
@@ -573,13 +520,14 @@ func (c *CACHE) WriteFile() {
 		file, fileErr := os.OpenFile(c.fileName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if fileErr != nil {
 			c.logger.Error("failed to open cache file: %v", fileErr)
+			c.writePending.Store(false)
 			return
 		}
-		defer file.Close()
-
 		enc := gob.NewEncoder(file)
 		err = enc.Encode(peers)
+		file.Close()
 	} else {
+		c.writePending.Store(false)
 		return
 	}
 
@@ -587,8 +535,8 @@ func (c *CACHE) WriteFile() {
 		c.logger.Error("failed to write cache: %v", err)
 	} else {
 		c.lastWrite = time.Now()
-		c.writePending.Store(false)
 	}
+	c.writePending.Store(false)
 }
 
 func (c *CACHE) ReadFile() {
@@ -932,32 +880,28 @@ func (c *CACHE) UpdateUser(user *UserObj) bool {
 	c.Lock()
 	defer c.Unlock()
 
-	// Skip min users if we already have full user data
 	if user.Min {
 		if existingUser, ok := c.users[user.ID]; ok && !existingUser.Min {
-			// Keep the full user data, don't overwrite with min
 			return false
 		}
-		// Update even if it's min (for first time or min->min)
 		c.users[user.ID] = user
-		// Don't update username map for min users to avoid inconsistency
-		return false // Don't trigger file write for min users
+		if user.AccessHash != 0 {
+			if _, hasReal := c.InputPeers.InputUsers[user.ID]; !hasReal {
+				c.minUsers[user.ID] = user.AccessHash
+			}
+		}
+		return false
 	}
 
-	// Full user data - always update
 	c.users[user.ID] = user
+	delete(c.minUsers, user.ID)
 
-	// Update username mapping only for non-min users with access hash
 	if user.Username != "" {
 		c.usernameMap[user.Username] = user.ID
-		// Ensure InputPeers has the mapping too
-		if _, ok := c.InputPeers.InputUsers[user.ID]; !ok {
-			c.InputPeers.InputUsers[user.ID] = user.AccessHash
-		}
 	}
 
-	// Check if access hash changed
 	if currAccessHash, ok := c.InputPeers.InputUsers[user.ID]; ok {
+		c.touchUserLRU(user.ID)
 		if currAccessHash != user.AccessHash {
 			c.InputPeers.InputUsers[user.ID] = user.AccessHash
 			return true
@@ -965,12 +909,9 @@ func (c *CACHE) UpdateUser(user *UserObj) bool {
 		return false
 	}
 
-	// New user
 	c.InputPeers.InputUsers[user.ID] = user.AccessHash
-
-	// Enforce size limit after adding new entry
+	c.touchUserLRU(user.ID)
 	c.enforceSizeLimit()
-
 	return true
 }
 
@@ -978,32 +919,28 @@ func (c *CACHE) UpdateChannel(channel *Channel) bool {
 	c.Lock()
 	defer c.Unlock()
 
-	// Skip min channels if we already have full channel data
 	if channel.Min {
 		if existingCh, ok := c.channels[channel.ID]; ok && !existingCh.Min {
-			// Keep the full channel data, don't overwrite with min
 			return false
 		}
-		// Update even if it's min (for first time or min->min)
 		c.channels[channel.ID] = channel
-		// Don't update username map for min channels to avoid inconsistency
-		return false // Don't trigger file write for min channels
+		if channel.AccessHash != 0 {
+			if _, hasReal := c.InputPeers.InputChannels[channel.ID]; !hasReal {
+				c.minChannels[channel.ID] = channel.AccessHash
+			}
+		}
+		return false
 	}
 
-	// Full channel data - always update
 	c.channels[channel.ID] = channel
+	delete(c.minChannels, channel.ID)
 
-	// Update username mapping only for non-min channels with access hash
 	if channel.Username != "" {
 		c.usernameMap[channel.Username] = channel.ID
-		// Ensure InputPeers has the mapping too
-		if _, ok := c.InputPeers.InputChannels[channel.ID]; !ok {
-			c.InputPeers.InputChannels[channel.ID] = channel.AccessHash
-		}
 	}
 
-	// Check if access hash changed
 	if currAccessHash, ok := c.InputPeers.InputChannels[channel.ID]; ok {
+		c.touchChannelLRU(channel.ID)
 		if currAccessHash != channel.AccessHash {
 			c.InputPeers.InputChannels[channel.ID] = channel.AccessHash
 			return true
@@ -1011,8 +948,9 @@ func (c *CACHE) UpdateChannel(channel *Channel) bool {
 		return false
 	}
 
-	// New channel
 	c.InputPeers.InputChannels[channel.ID] = channel.AccessHash
+	c.touchChannelLRU(channel.ID)
+	c.enforceSizeLimit()
 	return true
 }
 
@@ -1076,6 +1014,39 @@ func (cache *CACHE) UpdatePeersToCache(users []User, chats []Chat) {
 					Title:      ch.Title,
 				}
 				cache.InputPeers.InputChannels[ch.ID] = ch.AccessHash
+				cache.touchChannelLRU(ch.ID)
+			}
+			cache.Unlock()
+		case *Community:
+			cache.Lock()
+			if ch.Min {
+				if existing, ok := cache.channels[ch.ID]; !ok || existing.Min {
+					cache.channels[ch.ID] = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title, Min: true}
+					if ch.AccessHash != 0 {
+						if _, hasReal := cache.InputPeers.InputChannels[ch.ID]; !hasReal {
+							cache.minChannels[ch.ID] = ch.AccessHash
+						}
+					}
+				}
+			} else {
+				cache.channels[ch.ID] = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title}
+				delete(cache.minChannels, ch.ID)
+				if curr, ok := cache.InputPeers.InputChannels[ch.ID]; !ok || curr != ch.AccessHash {
+					cache.InputPeers.InputChannels[ch.ID] = ch.AccessHash
+					cache.touchChannelLRU(ch.ID)
+					cache.enforceSizeLimit()
+					totalUpdates[1]++
+				} else {
+					cache.touchChannelLRU(ch.ID)
+				}
+			}
+			cache.Unlock()
+		case *CommunityForbidden:
+			cache.Lock()
+			if _, ok := cache.InputPeers.InputChannels[ch.ID]; !ok {
+				cache.channels[ch.ID] = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title}
+				cache.InputPeers.InputChannels[ch.ID] = ch.AccessHash
+				cache.touchChannelLRU(ch.ID)
 			}
 			cache.Unlock()
 		case *ChatEmpty:
@@ -1084,7 +1055,6 @@ func (cache *CACHE) UpdatePeersToCache(users []User, chats []Chat) {
 
 	if totalUpdates[0] > 0 || totalUpdates[1] > 0 {
 		if !cache.memory && !cache.disabled {
-			// Debounced async write
 			if !cache.writePending.Load() {
 				cache.writePending.Store(true)
 				go func() {
@@ -1093,15 +1063,17 @@ func (cache *CACHE) UpdatePeersToCache(users []User, chats []Chat) {
 				}()
 			}
 		}
-		cache.RLock()
-		cache.logger.WithFields(map[string]any{
-			"new_users": totalUpdates[0],
-			"new_chats": totalUpdates[1],
-			"users":     len(cache.InputPeers.InputUsers),
-			"channels":  len(cache.InputPeers.InputChannels),
-			"usernames": len(cache.usernameMap),
-		}).Debug("cache updated")
-		cache.RUnlock()
+		if cache.logger.Lev() <= DebugLevel {
+			cache.RLock()
+			cache.logger.WithFields(map[string]any{
+				"new_users": totalUpdates[0],
+				"new_chats": totalUpdates[1],
+				"users":     len(cache.InputPeers.InputUsers),
+				"channels":  len(cache.InputPeers.InputChannels),
+				"usernames": len(cache.usernameMap),
+			}).Debug("cache updated")
+			cache.RUnlock()
+		}
 	}
 }
 

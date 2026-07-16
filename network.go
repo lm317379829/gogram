@@ -65,14 +65,10 @@ func (m *MTProto) sendPacketWithMsgID(request tl.Object, msgID int64, expectedTy
 	}
 
 	if m.transport == nil || !m.IsTcpActive() {
-		err := m.CreateConnection(false)
-		if err != nil || m.transport == nil {
-			return nil, 0, errors.New("failed to establish connection, transport is nil")
-		}
+		m.requestReconnect()
+		return nil, 0, errors.New("transport is not active")
 	}
 
-	maxRetries := 2
-sendPacket:
 	m.transportMu.Lock()
 	if m.transport == nil {
 		m.transportMu.Unlock()
@@ -82,13 +78,6 @@ sendPacket:
 	m.transportMu.Unlock()
 
 	if errorSendPacket != nil {
-		if maxRetries > 0 && isBrokenError(errorSendPacket) {
-			maxRetries--
-			err := m.Reconnect(false)
-			if err == nil && m.transport != nil {
-				goto sendPacket
-			}
-		}
 		return nil, msgID, fmt.Errorf("writing message: %w", errorSendPacket)
 	}
 	return resp, msgID, nil

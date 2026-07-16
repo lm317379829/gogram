@@ -73,6 +73,7 @@ func NewTransport(m messages.MessageInformator, conn ConnConfig, modeVariant mod
 		t.mode, err = mode.New(modeVariant, t.conn)
 	}
 	if err != nil {
+		t.conn.Close()
 		return nil, fmt.Errorf("setup mode: %w", err)
 	}
 

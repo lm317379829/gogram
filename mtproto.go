@@ -88,6 +88,7 @@ type MTProto struct {
 
 	ctxCancel      context.CancelFunc
 	ctxCancelMutex sync.Mutex
+	lifecycleMu    sync.Mutex
 	routineswg     sync.WaitGroup
 	memorySession  bool
 	tcpState       *TcpState
@@ -143,6 +144,7 @@ type MTProto struct {
 	exported              bool
 	cdn                   bool
 	terminated            atomic.Bool
+	disconnected          atomic.Bool
 	senderCounters        sync.Map // map[int]int32 - tracks sender count per DC
 
 	connConfig ReconnectConfig
@@ -633,15 +635,16 @@ func (m *MTProto) connectWithRetry(ctx context.Context) error {
 }
 
 func (m *MTProto) CreateConnection(withLog bool) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	if m.terminated.Load() {
 		return fmt.Errorf("mtproto is terminated, cannot create connection")
 	}
+	m.disconnected.Store(false)
 	m.stopRoutines()
+	m.routineswg.Wait()
 
 	m.transportMu.Lock()
-	if m.transport != nil {
-		m.transport.Close()
-	}
 	m.transport = nil
 	m.transportMu.Unlock()
 
@@ -649,6 +652,22 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 	m.ctxCancelMutex.Lock()
 	m.ctxCancel = cancelfunc
 	m.ctxCancelMutex.Unlock()
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		cancelfunc()
+		m.tcpState.SetActive(false)
+		m.transportMu.Lock()
+		if m.transport != nil {
+			m.transport.Close()
+			m.transport = nil
+		}
+		m.transportMu.Unlock()
+		m.routineswg.Wait()
+	}()
 
 	transportType := m.GetTransportType()
 	if withLog {
@@ -707,6 +726,7 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 		m.startPFSManager(ctx)
 	}
 
+	committed = true
 	return nil
 }
 
@@ -815,7 +835,7 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 					continue
 				}
 
-				if err := m.bindTempAuthKey(); err != nil {
+				if err := m.bindTempAuthKey(ctx); err != nil {
 					m.Logger.WithError(err).Error("failed to bind temporary auth key")
 					select {
 					case <-ctx.Done():
@@ -1066,134 +1086,83 @@ func (m *MTProto) stopRoutines() {
 }
 
 func (m *MTProto) Disconnect() error {
+	m.disconnected.Store(true)
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
-	done := make(chan struct{})
-	go func() {
-		m.routineswg.Wait()
-		close(done)
-	}()
 
-	select {
-	case <-done:
-		m.Logger.Trace("all routines stopped gracefully")
-	case <-time.After(10 * time.Second):
-		m.Logger.Debug("timeout waiting for routines to stop on disconnect; forcing transport close")
-		m.transportMu.Lock()
-		if m.transport != nil {
-			m.transport.Close()
-			m.transport = nil
-		}
-		m.transportMu.Unlock()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			m.Logger.Debug("routines still alive after force close")
-		}
-	}
-
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.routineswg.Wait()
+	m.transportMu.Lock()
+	m.transport = nil
+	m.transportMu.Unlock()
+	m.Logger.Trace("all routines stopped gracefully")
 	return nil
 }
 
 func (m *MTProto) Terminate() error {
 	m.terminated.Store(true)
-	m.stopRoutines()
-	m.responseChannels.Close()
-
-	m.transportMu.Lock()
-	if m.transport != nil {
-		m.transport.Close()
-		m.transport = nil
-	}
-	m.transportMu.Unlock()
-
+	m.disconnected.Store(true)
 	m.tcpState.SetActive(false)
+	m.stopRoutines()
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.routineswg.Wait()
+	m.responseChannels.Close()
+	m.transportMu.Lock()
+	m.transport = nil
+	m.transportMu.Unlock()
 	return nil
 }
 
-func (m *MTProto) SetTerminated(val bool) {
-	m.terminated.Store(val)
-}
+func (m *MTProto) SetTerminated(val bool) { m.terminated.Store(val) }
 
 func (m *MTProto) Reconnect(loggy bool) error {
+	if m.terminated.Load() {
+		return nil
+	}
+	m.disconnected.Store(false)
 	if !m.connState.InProgress.CompareAndSwap(false, true) {
-		m.Logger.Trace("reconnection already in progress, skipping duplicate attempt")
-		time.Sleep(50 * time.Millisecond)
+		m.Logger.Trace("reconnect already in progress")
 		return nil
 	}
 	defer m.connState.InProgress.Store(false)
 
-	if m.terminated.Load() {
-		m.Logger.Trace("skipping reconnect: mtproto is terminated")
-		return nil
-	}
+	addr := utils.FmtIP(m.GetAddr())
+	tx := m.GetTransportType()
+	start := time.Now()
+	m.logReconnect(loggy, "reconnecting to %s (%s)", addr, tx)
 
-	startTime := time.Now()
-	if loggy {
-		m.Logger.Info("reconnecting to %s (%s)", utils.FmtIP(m.GetAddr()), m.GetTransportType())
-	} else {
-		m.Logger.Debug("reconnecting to %s (%s)", utils.FmtIP(m.GetAddr()), m.GetTransportType())
-	}
-
-	m.tcpState.SetActive(false)
-	m.stopRoutines()
-
-	drained := make(chan struct{})
-	go func() {
-		m.routineswg.Wait()
-		close(drained)
-	}()
-	select {
-	case <-drained:
-	case <-time.After(5 * time.Second):
-		m.Logger.Debug("reconnect: routines did not drain in time")
-	}
-
-	err := m.CreateConnection(loggy)
-	if err != nil {
+	if err := m.CreateConnection(loggy); err != nil {
 		m.Logger.WithError(err).Error("failed to recreate connection")
 		return fmt.Errorf("recreating connection: %w", err)
 	}
 
-	duration := time.Since(startTime)
-	if loggy {
-		m.Logger.Info("reconnected to %s (%s) in %v", utils.FmtIP(m.GetAddr()), m.GetTransportType(), duration)
-	} else {
-		m.Logger.Debug("reconnected to %s (%s) in %v", utils.FmtIP(m.GetAddr()), m.GetTransportType(), duration)
-	}
-
+	m.logReconnect(loggy, "reconnected to %s (%s) in %v", addr, tx, time.Since(start))
 	if m.transport != nil {
 		m.Ping()
 	}
-
 	return nil
 }
 
+func (m *MTProto) requestReconnect() {
+	if m.terminated.Load() || m.disconnected.Load() {
+		return
+	}
+	go m.Reconnect(false)
+}
+
+func (m *MTProto) logReconnect(loggy bool, format string, args ...any) {
+	if loggy {
+		m.Logger.Info(format, args...)
+	} else {
+		m.Logger.Debug(format, args...)
+	}
+}
+
 func (m *MTProto) Redial() error {
-	if !m.connState.InProgress.CompareAndSwap(false, true) {
-		m.Logger.Trace("redialing already in progress")
-		return nil
-	}
-	defer m.connState.InProgress.Store(false)
-
-	m.Logger.Debug("forcing transport redial")
-	m.tcpState.SetActive(false)
-
-	m.transportMu.Lock()
-	if m.transport != nil {
-		m.transport.Close()
-	}
-	m.transportMu.Unlock()
-
-	if err := m.connectWithRetry(context.TODO()); err != nil {
-		m.Logger.WithError(err).Error("redial failed")
-		return err
-	}
-
-	m.tcpState.SetActive(true)
-	m.connState.ConsecutiveTimeouts.Store(0)
-	m.Logger.Debug("transport redial successful")
-	return nil
+	return m.Reconnect(false)
 }
 
 // keep pinging to keep the connection alive
@@ -1374,15 +1343,8 @@ func (m *MTProto) startReadingResponses(ctx context.Context) {
 				}
 
 				m.Logger.Trace("connection lost: %v; reconnecting", err)
-				if reconnErr := m.tryReconnect(); reconnErr != nil {
-					m.Logger.Debug("reconnect failed: %v", reconnErr)
-				}
-
-				if errors.Is(err, io.EOF) {
-					m.Logger.Trace("server closed connection (EOF)")
-					return
-				}
-				continue
+				m.requestReconnect()
+				return
 			}
 
 			m.Logger.Trace("error reading message: %v", err)
@@ -1406,9 +1368,8 @@ func (m *MTProto) startReadingResponses(ctx context.Context) {
 						m.Logger.Warn(FormatDecodeError(err))
 					} else if !m.connState.InProgress.Load() {
 						m.Logger.Trace("read error: %v; reconnecting", err)
-						if err := m.tryReconnect(); err != nil {
-							m.Logger.Debug("reconnect failed: %v", err)
-						}
+						m.requestReconnect()
+						return
 					} else {
 						m.Logger.Trace("error during active reconnect, waiting")
 						time.Sleep(50 * time.Millisecond)
@@ -1440,9 +1401,7 @@ func (m *MTProto) handle404Error() error {
 
 	if count > 4 && count < 16 {
 		m.Logger.Debug("auth key error occurred %d times, reconnecting", count)
-		if err := m.tryReconnect(); err != nil {
-			return err
-		}
+		m.requestReconnect()
 	} else if count >= 16 {
 		m.errorHandler(ErrAuthKeyInvalid)
 		return ErrAuthKeyInvalid
@@ -1561,10 +1520,8 @@ messageTypeSwitching:
 				info[i] = 0x01
 			}
 		}
-		m.routineswg.Add(1)
 		go func() {
-			defer m.routineswg.Done()
-			if m.terminated.Load() {
+			if m.terminated.Load() || m.disconnected.Load() {
 				return
 			}
 			if _, err := m.MakeRequest(&objects.MsgsStateInfo{ReqMsgID: int64(msg.GetMsgID()), Info: info}); err != nil {

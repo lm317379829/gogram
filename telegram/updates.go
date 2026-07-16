@@ -1491,6 +1491,28 @@ func (c *Client) fetchPeersBeforeUpdate(m Message, pts int32) {
 	}
 }
 
+func (c *Client) fetchChannelPeersBeforeUpdate(m Message, pts int32) {
+	msg, ok := m.(*MessageObj)
+	if !ok {
+		c.handleMessageUpdate(m)
+		return
+	}
+	peerCached := c.IdInCache(c.GetPeerID(msg.PeerID))
+	senderCached := msg.FromID == nil || c.IdInCache(c.GetPeerID(msg.FromID))
+	if peerCached && senderCached {
+		c.handleMessageUpdate(msg)
+		return
+	}
+	if peer, ok := msg.PeerID.(*PeerChannel); ok && pts > 0 {
+		currentPts := c.dispatcher.GetChannelPts(peer.ChannelID)
+		if currentPts == 0 || pts-1 < currentPts {
+			currentPts = pts - 1
+		}
+		c.FetchChannelDifference(peer.ChannelID, currentPts, 10)
+	}
+	c.handleMessageUpdate(msg)
+}
+
 func (c *Client) handleEditUpdate(update Message) {
 	if msg, ok := update.(*MessageObj); ok {
 		if msg.Out {
@@ -2750,7 +2772,7 @@ func HandleIncomingUpdates(u any, c *Client) bool {
 			return false
 		}
 		c.dispatcher.SetDate(upd.Date)
-		go c.Cache.UpdatePeersToCache(upd.Users, upd.Chats)
+		c.Cache.UpdatePeersToCache(upd.Users, upd.Chats)
 		for _, update := range upd.Updates {
 			c.applyIncomingUpdate(update)
 		}
@@ -2760,7 +2782,7 @@ func HandleIncomingUpdates(u any, c *Client) bool {
 			return false
 		}
 		c.dispatcher.SetDate(upd.Date)
-		go c.Cache.UpdatePeersToCache(upd.Users, upd.Chats)
+		c.Cache.UpdatePeersToCache(upd.Users, upd.Chats)
 		for _, update := range upd.Updates {
 			c.applyIncomingUpdate(update)
 		}
@@ -2814,7 +2836,7 @@ func (c *Client) dispatchUpdate(update Update) {
 		go c.fetchPeersBeforeUpdate(upd.Message, upd.Pts)
 		go c.handleMessageUpdate(upd.Message)
 	case *UpdateNewChannelMessage:
-		go c.handleMessageUpdate(upd.Message)
+		go c.fetchChannelPeersBeforeUpdate(upd.Message, upd.Pts)
 	case *UpdateNewScheduledMessage:
 		go c.handleMessageUpdate(upd.Message)
 	case *UpdateEditMessage:

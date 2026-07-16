@@ -363,7 +363,7 @@ func (m *MTProto) createTempAuthKey(expiresIn int32) error {
 }
 
 // bindTempAuthKey binds the temporary auth key to the permanent auth key using auth.bindTempAuthKey.
-func (m *MTProto) bindTempAuthKey() error {
+func (m *MTProto) bindTempAuthKey(ctx context.Context) error {
 	newTempKey := m.pendingTempAuthKey
 	if newTempKey == nil {
 		newTempKey = m.tempAuthKey
@@ -452,7 +452,14 @@ func (m *MTProto) bindTempAuthKey() error {
 		return fmt.Errorf("auth.bindTempAuthKey: %w", err)
 	}
 
-	response := <-respCh
+	var response tl.Object
+	select {
+	case response = <-respCh:
+	case <-ctx.Done():
+		m.tempAuthKey = prevTempKey
+		m.tempAuthKeyHash = prevTempHash
+		return ctx.Err()
+	}
 	if rpcErr, ok := response.(*objects.RpcError); ok {
 		m.tempAuthKey = prevTempKey
 		m.tempAuthKeyHash = prevTempHash
