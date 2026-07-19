@@ -689,12 +689,7 @@ func (c *Client) GetInputPeer(peerID int64) (InputPeer, error) {
 		return &InputPeerUser{peerID, userHash}, nil
 	}
 
-	// try to fetch from Telegram
-	if user, err := c.getUserFromCache(peerID); err == nil {
-		return &InputPeerUser{peerID, user.AccessHash}, nil
-	}
-
-	// check if it's a channel without -100 prefix
+	// check if it's a channel without -100 prefix before hitting the network
 	c.Cache.RLock()
 	channelHash, channelExists := c.Cache.InputPeers.InputChannels[peerID]
 	c.Cache.RUnlock()
@@ -703,7 +698,12 @@ func (c *Client) GetInputPeer(peerID int64) (InputPeer, error) {
 		return &InputPeerChannel{peerID, channelHash}, nil
 	}
 
-	return nil, fmt.Errorf("there is no peer with id '%d' or missing from cache", peerID)
+	user, err := c.getUserFromCache(peerID)
+	if err == nil {
+		return &InputPeerUser{peerID, user.AccessHash}, nil
+	}
+
+	return nil, fmt.Errorf("resolving peer '%d': %w", peerID, err)
 }
 
 // ------------------ Get Chat/Channel/User From Cache/Telegram ------------------
@@ -745,13 +745,15 @@ func (c *Client) getUserFromCache(userID int64) (*UserObj, error) {
 		return nil, fmt.Errorf("no user with id '%d'", userID)
 	}
 
-	user, ok := users[0].(*UserObj)
-	if !ok {
-		return nil, fmt.Errorf("expected UserObj for id '%d', but got different type", userID)
+	switch u := users[0].(type) {
+	case *UserObj:
+		c.Cache.UpdateUser(u)
+		return u, nil
+	case *UserEmpty:
+		return nil, fmt.Errorf("user '%d' is unknown to this account; a valid access_hash is required to resolve them", userID)
+	default:
+		return nil, fmt.Errorf("expected UserObj for id '%d', but got %T", userID, users[0])
 	}
-	c.Cache.UpdateUser(user)
-
-	return user, nil
 }
 
 func (c *Client) getChannelFromCache(channelID int64) (*Channel, error) {
@@ -795,13 +797,17 @@ func (c *Client) getChannelFromCache(channelID int64) (*Channel, error) {
 		return nil, fmt.Errorf("no channel with id '%d'", channelID)
 	}
 
-	channel, ok := channelsObj.Chats[0].(*Channel)
-	if !ok {
-		return nil, fmt.Errorf("expected Channel for id '%d', but got different type", channelID)
+	switch ch := channelsObj.Chats[0].(type) {
+	case *Channel:
+		c.Cache.UpdateChannel(ch)
+		return ch, nil
+	case *ChannelForbidden:
+		return nil, fmt.Errorf("channel '%d' is forbidden (access denied)", channelID)
+	case *ChatEmpty:
+		return nil, fmt.Errorf("channel '%d' is unknown to this account; a valid access_hash is required", channelID)
+	default:
+		return nil, fmt.Errorf("expected Channel for id '%d', but got %T", channelID, channelsObj.Chats[0])
 	}
-	c.Cache.UpdateChannel(channel)
-
-	return channel, nil
 }
 
 func (c *Client) getChatFromCache(chatID int64) (*ChatObj, error) {
