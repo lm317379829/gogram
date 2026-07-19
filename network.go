@@ -128,7 +128,7 @@ func (m *MTProto) getRespChannel() chan tl.Object {
 	if m.serviceModeActivated {
 		return m.serviceChannel
 	}
-	return make(chan tl.Object)
+	return make(chan tl.Object, 1)
 }
 
 func isNotContentRelated(t tl.Object) bool {

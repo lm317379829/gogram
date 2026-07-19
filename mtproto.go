@@ -815,7 +815,7 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 					continue
 				}
 
-				if err := m.bindTempAuthKey(); err != nil {
+				if err := m.bindTempAuthKey(ctx); err != nil {
 					m.Logger.WithError(err).Error("failed to bind temporary auth key")
 					select {
 					case <-ctx.Done():
