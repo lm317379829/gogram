@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -131,6 +132,7 @@ type MTProto struct {
 	authKey404Count atomic.Int64
 	authKey404Time  atomic.Int64
 	IpV6            bool
+	obfuscated      bool
 
 	Logger *utils.Logger
 
@@ -167,9 +169,9 @@ type Config struct {
 	AppID          int32                 // Telegram API ID
 	EnablePFS      bool                  // Enable Perfect Forward Secrecy
 
-	FloodHandler      func(ctx context.Context, err error) bool  // Called on FLOOD_WAIT; return true to retry
-	ErrorHandler      func(err error) bool  // Called on errors; return true to retry
-	ConnectionHandler func(err error) error // Custom reconnection handler
+	FloodHandler      func(ctx context.Context, err error) bool // Called on FLOOD_WAIT; return true to retry
+	ErrorHandler      func(err error) bool                      // Called on errors; return true to retry
+	ConnectionHandler func(err error) error                     // Custom reconnection handler
 
 	ServerHost     string         // Telegram server address (IP:port)
 	PublicKey      *rsa.PublicKey // RSA public key for server verification
@@ -183,6 +185,7 @@ type Config struct {
 	Timeout        int            // TCP connection timeout (seconds)
 	ReqTimeout     int            // RPC request timeout (seconds)
 	Transport      TransportType  // Transport variant (default TransportTCP)
+	Obfuscated     bool           // Wrap the TCP transport with obfuscation (mtproto obfuscated2)
 	HTTPPath       string         // HTTP request path (default "/api"; only used for HTTP/HTTPS)
 	PFSKeyLifetime int32          // Lifetime (seconds) for temp auth keys when EnablePFS is set; 0 = 24h
 
@@ -247,6 +250,7 @@ func NewMTProto(c Config) (*MTProto, error) {
 		reqTimeout:            utils.MinSafeDuration(c.ReqTimeout),
 		mode:                  parseTransportMode(c.Mode),
 		IpV6:                  c.Ipv6,
+		obfuscated:            c.Obfuscated,
 		tcpState:              NewTcpState(),
 		DcList:                utils.NewDCOptions(),
 		connConfig: ReconnectConfig{
@@ -299,13 +303,11 @@ func NewMTProto(c Config) (*MTProto, error) {
 
 func parseTransportMode(sMode string) mode.Variant {
 	switch sMode {
-	case "modeAbridged":
-		return mode.Abridged
-	case "modeFull":
+	case "Full":
 		return mode.Full
-	case "modeIntermediate":
+	case "Intermediate":
 		return mode.Intermediate
-	case "modePaddedIntermediate":
+	case "PaddedIntermediate":
 		return mode.PaddedIntermediate
 	default:
 		return mode.Abridged
@@ -502,6 +504,8 @@ func (m *MTProto) SwitchDc(dc int) error {
 }
 
 func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, error) {
+	isCdn := len(cdn) > 0 && cdn[0]
+	isMedia := len(cdn) > 1 && cdn[1]
 	newAddr := m.DcList.GetHostIP(dcID, false, m.IpV6)
 
 	var senderNum int32
@@ -513,10 +517,19 @@ func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, er
 	m.senderCounters.Store(dcID, senderNum)
 
 	var loggerPrefix string
-	if len(cdn) > 0 && cdn[0] {
+	switch {
+	case isCdn:
 		newAddr, _ = m.DcList.GetCDNAddr(dcID)
 		loggerPrefix = fmt.Sprintf("gogram [cdn>>dc%d#%d]", dcID, senderNum)
-	} else {
+	case isMedia:
+		if mediaAddr, ok := m.DcList.GetMediaAddr(dcID, m.IpV6); ok {
+			newAddr = mediaAddr
+			m.Logger.Debug("sender #%d targeting media DC%d at %s", senderNum, dcID, mediaAddr)
+		} else {
+			m.Logger.Debug("sender #%d requested media DC%d but none advertised; using regular %s", senderNum, dcID, newAddr)
+		}
+		loggerPrefix = fmt.Sprintf("gogram [media>>dc%d#%d]", dcID, senderNum)
+	default:
 		loggerPrefix = fmt.Sprintf("gogram [sender>>dc%d#%d]", dcID, senderNum)
 	}
 
@@ -536,6 +549,7 @@ func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, er
 		Timeout:        int(m.connConfig.Timeout.Seconds()),
 		ReqTimeout:     int(m.reqTimeout.Seconds()),
 		Transport:      m.txType,
+		Obfuscated:     m.obfuscated,
 		HTTPPath:       m.httpPath,
 		EnablePFS:      m.enablePFS,
 		PFSKeyLifetime: m.pfsKeyLifetime,
@@ -555,8 +569,15 @@ func (m *MTProto) ExportNewSender(dcID int, mem bool, cdn ...bool) (*MTProto, er
 
 	sender.noRedirect = true
 	sender.exported = true
-	if len(cdn) > 0 && cdn[0] {
+	if isCdn {
 		sender.cdn = true
+		m.cdnKeysMu.RLock()
+		if len(m.cdnKeys) > 0 {
+			inherited := make(map[int32]*rsa.PublicKey, len(m.cdnKeys))
+			maps.Copy(inherited, m.cdnKeys)
+			sender.cdnKeys = inherited
+		}
+		m.cdnKeysMu.RUnlock()
 	}
 
 	if err := sender.CreateConnection(false); err != nil {
@@ -665,8 +686,10 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 	m.startReadingResponses(ctx)
 
 	if !m.exported && !m.cdn {
+		m.routineswg.Add(1)
 		go m.longPing(ctx)
 		if m.isHTTPTransport() {
+			m.routineswg.Add(1)
 			go m.httpWaiter(ctx)
 		}
 	}
@@ -721,6 +744,7 @@ func (m *MTProto) connect(ctx context.Context) error {
 		newTransport, err = transport.NewTransport(m, transport.TCPConnConfig{
 			CommonConfig: cfg,
 			IpV6:         m.IpV6,
+			Obfuscated:   m.obfuscated,
 		}, m.mode)
 	}
 
@@ -1054,7 +1078,18 @@ func (m *MTProto) Disconnect() error {
 	case <-done:
 		m.Logger.Trace("all routines stopped gracefully")
 	case <-time.After(10 * time.Second):
-		m.Logger.Debug("timeout waiting for routines to stop on disconnect")
+		m.Logger.Debug("timeout waiting for routines to stop on disconnect; forcing transport close")
+		m.transportMu.Lock()
+		if m.transport != nil {
+			m.transport.Close()
+			m.transport = nil
+		}
+		m.transportMu.Unlock()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			m.Logger.Debug("routines still alive after force close")
+		}
 	}
 
 	return nil
@@ -1102,6 +1137,17 @@ func (m *MTProto) Reconnect(loggy bool) error {
 
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
+
+	drained := make(chan struct{})
+	go func() {
+		m.routineswg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		m.Logger.Debug("reconnect: routines did not drain in time")
+	}
 
 	err := m.CreateConnection(loggy)
 	if err != nil {
@@ -1152,7 +1198,6 @@ func (m *MTProto) Redial() error {
 
 // keep pinging to keep the connection alive
 func (m *MTProto) longPing(ctx context.Context) {
-	m.routineswg.Add(1)
 	defer m.routineswg.Done()
 
 	ticker := time.NewTicker(defaultPingInterval)
@@ -1183,7 +1228,6 @@ func (m *MTProto) isHTTPTransport() bool {
 }
 
 func (m *MTProto) httpWaiter(ctx context.Context) {
-	m.routineswg.Add(1)
 	defer m.routineswg.Done()
 
 	for {
@@ -1518,7 +1562,12 @@ messageTypeSwitching:
 				info[i] = 0x01
 			}
 		}
+		m.routineswg.Add(1)
 		go func() {
+			defer m.routineswg.Done()
+			if m.terminated.Load() {
+				return
+			}
 			if _, err := m.MakeRequest(&objects.MsgsStateInfo{ReqMsgID: int64(msg.GetMsgID()), Info: info}); err != nil {
 				m.Logger.Debug("msgs_state_info: %v", err)
 			}

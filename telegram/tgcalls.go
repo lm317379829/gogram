@@ -183,7 +183,6 @@ func (c *Client) GetGroupCallStream(chatId any) (*GroupCallStream, error) {
 	}, nil
 }
 
-
 type StartGroupCallOptions struct {
 	Title        string
 	ScheduleDate time.Time

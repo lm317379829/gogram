@@ -96,6 +96,9 @@ func (m *MTProto) makeAuthKeyOnce(expiresIn int32) error {
 					break
 				}
 			}
+			if found {
+				break
+			}
 		}
 		if uint64(b) == binary.LittleEndian.Uint64(keys.RSAFingerprint(m.publicKey)) {
 			found = true
@@ -115,7 +118,8 @@ func (m *MTProto) makeAuthKeyOnce(expiresIn int32) error {
 	nonceServer := res.ServerNonce
 
 	var message []byte
-	if isTemp {
+	switch {
+	case isTemp:
 		message, err = tl.Marshal(&objects.PQInnerDataTempDc{
 			Pq:          res.Pq,
 			P:           p.Bytes(),
@@ -126,7 +130,17 @@ func (m *MTProto) makeAuthKeyOnce(expiresIn int32) error {
 			Dc:          int32(m.GetDC()),
 			ExpiresIn:   expiresIn,
 		})
-	} else {
+	case m.cdn:
+		message, err = tl.Marshal(&objects.PQInnerDataDc{
+			Pq:          res.Pq,
+			P:           p.Bytes(),
+			Q:           q.Bytes(),
+			Nonce:       nonceFirst,
+			ServerNonce: nonceServer,
+			NewNonce:    nonceSecond,
+			Dc:          int32(m.GetDC()),
+		})
+	default:
 		message, err = tl.Marshal(&objects.PQInnerData{
 			Pq:          res.Pq,
 			P:           p.Bytes(),
@@ -141,10 +155,14 @@ func (m *MTProto) makeAuthKeyOnce(expiresIn int32) error {
 		return err
 	}
 
-	hashAndMsg := make([]byte, 255)
-	copy(hashAndMsg, append(utils.Sha1(string(message)), message...))
-
-	encryptedMessage, err := math.DoRSAencrypt(hashAndMsg, m.publicKey)
+	var encryptedMessage []byte
+	if m.cdn || isTemp {
+		encryptedMessage, err = math.DoRSAPad(message, m.publicKey)
+	} else {
+		hashAndMsg := make([]byte, 255)
+		copy(hashAndMsg, append(utils.Sha1(string(message)), message...))
+		encryptedMessage, err = math.DoRSAencrypt(hashAndMsg, m.publicKey)
+	}
 	if err != nil {
 		return fmt.Errorf("rsa encrypt: %w", err)
 	}
@@ -295,25 +313,25 @@ dhGenSuccess:
 // createTempAuthKey performs the temporary auth key handshake
 func (m *MTProto) createTempAuthKey(expiresIn int32) error {
 	cfg := Config{
-		AuthKeyFile:     "__pfs__temp",
-		AuthAESKey:      "",
-		SessionStorage:  session.NewInMemory(),
-		MemorySession:   true,
-		AppID:           m.appID,
-		EnablePFS:       false,
-		ServerHost:      m.GetAddr(),
-		PublicKey:       m.publicKey,
-		DataCenter:      m.GetDC(),
-		Logger:          m.Logger.Clone().WithPrefix("gogram [mtp-pfs]"),
-		Proxy:           m.proxy,
-		Mode:            "Abridged",
-		Ipv6:            m.IpV6,
-		CustomHost:      true,
-		LocalAddr:       m.localAddr,
-		Timeout:         int(m.connConfig.Timeout.Seconds()),
-		ReqTimeout:      int(m.reqTimeout.Seconds()),
-		Transport: m.txType,
-		HTTPPath:  m.httpPath,
+		AuthKeyFile:    "__pfs__temp",
+		AuthAESKey:     "",
+		SessionStorage: session.NewInMemory(),
+		MemorySession:  true,
+		AppID:          m.appID,
+		EnablePFS:      false,
+		ServerHost:     m.GetAddr(),
+		PublicKey:      m.publicKey,
+		DataCenter:     m.GetDC(),
+		Logger:         m.Logger.Clone().WithPrefix("gogram [mtp-pfs]"),
+		Proxy:          m.proxy,
+		Mode:           "Abridged",
+		Ipv6:           m.IpV6,
+		CustomHost:     true,
+		LocalAddr:      m.localAddr,
+		Timeout:        int(m.connConfig.Timeout.Seconds()),
+		ReqTimeout:     int(m.reqTimeout.Seconds()),
+		Transport:      m.txType,
+		HTTPPath:       m.httpPath,
 	}
 
 	tmp, err := NewMTProto(cfg)

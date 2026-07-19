@@ -248,6 +248,7 @@ func (*AccountDaysTtl) CRC() uint32 {
 	return 0xb8d0afdf
 }
 
+// An example showing how an AI composer tone rephrases a message, used as a preview in the tone picker.
 type AiComposeToneExample struct {
 	From *TextWithEntities
 	To   *TextWithEntities
@@ -570,12 +571,17 @@ func (*BotBusinessConnection) FlagIndex() int {
 
 // Describes a bot command that can be used in a chat
 type BotCommand struct {
+	Ephemeral   bool `tl:"flag:0,encoded_in_bitflags"`
 	Command     string
 	Description string
 }
 
 func (*BotCommand) CRC() uint32 {
-	return 0xc27ac8c7
+	return 0x9852d6d2
+}
+
+func (*BotCommand) FlagIndex() int {
+	return 0
 }
 
 // Info about bots (available bot commands, etc)
@@ -637,6 +643,7 @@ func (*BotVerifierSettings) FlagIndex() int {
 	return 0
 }
 
+// Access restriction settings for a managed bot.
 type BotsAccessSettings struct {
 	Restricted bool   `tl:"flag:0,encoded_in_bitflags"`
 	AddUsers   []User `tl:"flag:1"`
@@ -661,6 +668,7 @@ func (*BotsBotInfo) CRC() uint32 {
 	return 0xe8a775b0
 }
 
+// The bot token of a managed bot, exported by the manager bot.
 type BotsExportedBotToken struct {
 	Token string
 }
@@ -693,6 +701,7 @@ func (*BotsPreviewInfo) CRC() uint32 {
 	return 0xca71d64
 }
 
+// Contains the request ID a bot should pass to a Mini App after preparing a peer request button with bots.requestWebViewButton
 type BotsRequestedButton struct {
 	WebappReqID string
 }
@@ -977,6 +986,7 @@ type ChatAdminRights struct {
 	DeleteStories        bool `tl:"flag:16,encoded_in_bitflags"`
 	ManageDirectMessages bool `tl:"flag:17,encoded_in_bitflags"`
 	ManageRanks          bool `tl:"flag:18,encoded_in_bitflags"`
+	ManageLinkedPeers    bool `tl:"flag:19,encoded_in_bitflags"`
 }
 
 func (*ChatAdminRights) CRC() uint32 {
@@ -1000,29 +1010,30 @@ func (*ChatAdminWithInvites) CRC() uint32 {
 
 // Represents the rights of a normal user in a supergroup/channel/chat. In this case, the flags are inverted: if set, a flag does not allow a user to do X.
 type ChatBannedRights struct {
-	ViewMessages    bool `tl:"flag:0,encoded_in_bitflags"`
-	SendMessages    bool `tl:"flag:1,encoded_in_bitflags"`
-	SendMedia       bool `tl:"flag:2,encoded_in_bitflags"`
-	SendStickers    bool `tl:"flag:3,encoded_in_bitflags"`
-	SendGifs        bool `tl:"flag:4,encoded_in_bitflags"`
-	SendGames       bool `tl:"flag:5,encoded_in_bitflags"`
-	SendInline      bool `tl:"flag:6,encoded_in_bitflags"`
-	EmbedLinks      bool `tl:"flag:7,encoded_in_bitflags"`
-	SendPolls       bool `tl:"flag:8,encoded_in_bitflags"`
-	ChangeInfo      bool `tl:"flag:10,encoded_in_bitflags"`
-	InviteUsers     bool `tl:"flag:15,encoded_in_bitflags"`
-	PinMessages     bool `tl:"flag:17,encoded_in_bitflags"`
-	ManageTopics    bool `tl:"flag:18,encoded_in_bitflags"`
-	SendPhotos      bool `tl:"flag:19,encoded_in_bitflags"`
-	SendVideos      bool `tl:"flag:20,encoded_in_bitflags"`
-	SendRoundvideos bool `tl:"flag:21,encoded_in_bitflags"`
-	SendAudios      bool `tl:"flag:22,encoded_in_bitflags"`
-	SendVoices      bool `tl:"flag:23,encoded_in_bitflags"`
-	SendDocs        bool `tl:"flag:24,encoded_in_bitflags"`
-	SendPlain       bool `tl:"flag:25,encoded_in_bitflags"`
-	EditRank        bool `tl:"flag:26,encoded_in_bitflags"`
-	SendReactions   bool `tl:"flag:27,encoded_in_bitflags"`
-	UntilDate       int32
+	ViewMessages      bool `tl:"flag:0,encoded_in_bitflags"`
+	SendMessages      bool `tl:"flag:1,encoded_in_bitflags"`
+	SendMedia         bool `tl:"flag:2,encoded_in_bitflags"`
+	SendStickers      bool `tl:"flag:3,encoded_in_bitflags"`
+	SendGifs          bool `tl:"flag:4,encoded_in_bitflags"`
+	SendGames         bool `tl:"flag:5,encoded_in_bitflags"`
+	SendInline        bool `tl:"flag:6,encoded_in_bitflags"`
+	EmbedLinks        bool `tl:"flag:7,encoded_in_bitflags"`
+	SendPolls         bool `tl:"flag:8,encoded_in_bitflags"`
+	ChangeInfo        bool `tl:"flag:10,encoded_in_bitflags"`
+	InviteUsers       bool `tl:"flag:15,encoded_in_bitflags"`
+	PinMessages       bool `tl:"flag:17,encoded_in_bitflags"`
+	ManageTopics      bool `tl:"flag:18,encoded_in_bitflags"`
+	SendPhotos        bool `tl:"flag:19,encoded_in_bitflags"`
+	SendVideos        bool `tl:"flag:20,encoded_in_bitflags"`
+	SendRoundvideos   bool `tl:"flag:21,encoded_in_bitflags"`
+	SendAudios        bool `tl:"flag:22,encoded_in_bitflags"`
+	SendVoices        bool `tl:"flag:23,encoded_in_bitflags"`
+	SendDocs          bool `tl:"flag:24,encoded_in_bitflags"`
+	SendPlain         bool `tl:"flag:25,encoded_in_bitflags"`
+	EditRank          bool `tl:"flag:26,encoded_in_bitflags"`
+	SendReactions     bool `tl:"flag:27,encoded_in_bitflags"`
+	ManageLinkedPeers bool `tl:"flag:28,encoded_in_bitflags"`
+	UntilDate         int32
 }
 
 func (*ChatBannedRights) CRC() uint32 {
@@ -1110,6 +1121,62 @@ func (*CodeSettings) CRC() uint32 {
 }
 
 func (*CodeSettings) FlagIndex() int {
+	return 0
+}
+
+type CommunitiesParticipantJoinedChats struct {
+	CreatorChatIds []int64
+	JoinedChatIds  []int64
+	Chats          []Chat
+	Users          []User
+}
+
+func (*CommunitiesParticipantJoinedChats) CRC() uint32 {
+	return 0x8d78512a
+}
+
+type CommunitiesPeerLinkRequests struct {
+	TotalCount int32
+	Requests   []*CommunityPeerRequest
+	NextOffset string `tl:"flag:0"`
+	Chats      []Chat
+	Users      []User
+}
+
+func (*CommunitiesPeerLinkRequests) CRC() uint32 {
+	return 0x2244afad
+}
+
+func (*CommunitiesPeerLinkRequests) FlagIndex() int {
+	return 0
+}
+
+type CommunityPeer struct {
+	CanViewHistory bool `tl:"flag:2,encoded_in_bitflags"`
+	Visible        bool `tl:"flag:0"`
+	Peer           Peer
+}
+
+func (*CommunityPeer) CRC() uint32 {
+	return 0x76141ebd
+}
+
+func (*CommunityPeer) FlagIndex() int {
+	return 0
+}
+
+type CommunityPeerRequest struct {
+	Visible     bool `tl:"flag:0,encoded_in_bitflags"`
+	Peer        Peer
+	RequestedBy int64
+	Date        int32
+}
+
+func (*CommunityPeerRequest) CRC() uint32 {
+	return 0x7beafa85
+}
+
+func (*CommunityPeerRequest) FlagIndex() int {
 	return 0
 }
 
@@ -1382,6 +1449,29 @@ func (*EmojiURL) CRC() uint32 {
 	return 0xa575739d
 }
 
+type EphemeralMessage struct {
+	Out         bool `tl:"flag:0,encoded_in_bitflags"`
+	ID          int32
+	FromID      Peer
+	PeerID      Peer
+	ReceiverID  int64
+	TopMsgID    int32 `tl:"flag:1"`
+	Date        int32
+	Message     string
+	Entities    []MessageEntity    `tl:"flag:2"`
+	Media       MessageMedia       `tl:"flag:3"`
+	ReplyMarkup ReplyMarkup        `tl:"flag:4"`
+	ReplyTo     MessageReplyHeader `tl:"flag:6"`
+}
+
+func (*EphemeralMessage) CRC() uint32 {
+	return 0xd9c6dc1a
+}
+
+func (*EphemeralMessage) FlagIndex() int {
+	return 0
+}
+
 // Error.
 type Error struct {
 	Code int32
@@ -1566,6 +1656,7 @@ func (*GlobalPrivacySettings) FlagIndex() int {
 	return 0
 }
 
+// Describes a live story donor in the donation leaderboard.
 type GroupCallDonor struct {
 	Top    bool `tl:"flag:0,encoded_in_bitflags"`
 	My     bool `tl:"flag:1,encoded_in_bitflags"`
@@ -1581,6 +1672,7 @@ func (*GroupCallDonor) FlagIndex() int {
 	return 0
 }
 
+// Represents an in-call message, emoji reaction, paid live story comment or standalone paid live story donation.
 type GroupCallMessage struct {
 	FromAdmin        bool `tl:"flag:1,encoded_in_bitflags"`
 	ID               int32
@@ -1598,7 +1690,7 @@ func (*GroupCallMessage) FlagIndex() int {
 	return 0
 }
 
-// Info about a group call participant
+// Describes a group call participant and their current state, see applying group call updates.
 type GroupCallParticipant struct {
 	Muted           bool `tl:"flag:0,encoded_in_bitflags"`
 	Left            bool `tl:"flag:1,encoded_in_bitflags"`
@@ -1656,7 +1748,7 @@ func (*GroupCallParticipantVideoSourceGroup) CRC() uint32 {
 	return 0xdcb118b7
 }
 
-// Info about an RTMP stream in a group call or livestream
+// Describes an available RTMP stream channel and its current playback timestamp, see playing an RTMP livestream.
 type GroupCallStreamChannel struct {
 	Channel         int32
 	Scale           int32
@@ -1953,7 +2045,7 @@ func (*InputClientProxy) CRC() uint32 {
 	return 0x75588b3f
 }
 
-// Creates an encrypted chat.
+// An e2e encrypted chat.
 type InputEncryptedChat struct {
 	ChatID     int32
 	AccessHash int64
@@ -1973,6 +2065,7 @@ func (*InputFolderPeer) CRC() uint32 {
 	return 0xfbd2c296
 }
 
+// Read metric for a single message exposure, describing how long the message was visible in the chat viewport.
 type InputMessageReadMetric struct {
 	MsgID                         int32
 	ViewID                        int64
@@ -2560,6 +2653,14 @@ func (*MessagesComposedMessageWithAi) FlagIndex() int {
 	return 0
 }
 
+type MessagesComposedRichMessageWithAi struct {
+	Result *RichMessage
+}
+
+func (*MessagesComposedRichMessageWithAi) CRC() uint32 {
+	return 0x4c4537c8
+}
+
 // Folder and folder tags information
 type MessagesDialogFilters struct {
 	TagsEnabled bool `tl:"flag:0,encoded_in_bitflags"`
@@ -2593,6 +2694,7 @@ func (*MessagesDiscussionMessage) FlagIndex() int {
 	return 0
 }
 
+// Dice game outcome.
 type MessagesEmojiGameOutcome struct {
 	Seed           []byte
 	StakeTonAmount int64
@@ -2846,6 +2948,14 @@ type MessagesTranslateResult struct {
 
 func (*MessagesTranslateResult) CRC() uint32 {
 	return 0x33db32f8
+}
+
+type MessagesTranslatedRichMessage struct {
+	Result []*RichMessage
+}
+
+func (*MessagesTranslatedRichMessage) CRC() uint32 {
+	return 0x4203998f
 }
 
 // How users voted in a poll
@@ -3460,7 +3570,7 @@ func (*PhoneExportedGroupCallInvite) CRC() uint32 {
 	return 0x204bd158
 }
 
-// Contains info about a group call, and partial info about its participants.
+// Contains group call information and an initial participant page, see getting info about a group call.
 type PhoneGroupCall struct {
 	Call                   GroupCall
 	Participants           []*GroupCallParticipant
@@ -3473,6 +3583,7 @@ func (*PhoneGroupCall) CRC() uint32 {
 	return 0x9e727aad
 }
 
+// Contains a live story's total donations and top donors, see paid live story donations.
 type PhoneGroupCallStars struct {
 	TotalStars int64
 	TopDonors  []*GroupCallDonor
@@ -3484,7 +3595,7 @@ func (*PhoneGroupCallStars) CRC() uint32 {
 	return 0x9d1dbd26
 }
 
-// Info about RTMP streams in a group call or livestream
+// Contains the available channels of an RTMP-mode group call, see playing an RTMP livestream.
 type PhoneGroupCallStreamChannels struct {
 	Channels []*GroupCallStreamChannel
 }
@@ -3493,7 +3604,7 @@ func (*PhoneGroupCallStreamChannels) CRC() uint32 {
 	return 0xd0e482b2
 }
 
-// RTMP URL and stream key to be used in streaming software
+// Contains the RTMP publishing URL and secret stream key, see creating and publishing an RTMP livestream.
 type PhoneGroupCallStreamRtmpURL struct {
 	URL string
 	Key string
@@ -3503,7 +3614,7 @@ func (*PhoneGroupCallStreamRtmpURL) CRC() uint32 {
 	return 0x2dbf3432
 }
 
-// Info about the participants of a group call or livestream
+// Contains a page of group call participants, see getting info about a group call.
 type PhoneGroupParticipants struct {
 	Count        int32
 	Participants []*GroupCallParticipant
@@ -3517,7 +3628,7 @@ func (*PhoneGroupParticipants) CRC() uint32 {
 	return 0xf47751b6
 }
 
-// A list of peers that can be used to join a group call, presenting yourself as a specific user/channel.
+// Contains the peers that may be used to join a video chat/livestream, see joining on behalf of owned channels.
 type PhoneJoinAsPeers struct {
 	Peers []Peer
 	Chats []Chat
@@ -3807,6 +3918,7 @@ func (*ReceivedNotifyMessage) CRC() uint32 {
 	return 0xa384b779
 }
 
+// Summary of a peer's active stories, embedded in user.`stories_max_id` and channel.`stories_max_id` and returned by stories.getPeerMaxIDs.
 type RecentStory struct {
 	Live  bool  `tl:"flag:0,encoded_in_bitflags"`
 	MaxID int32 `tl:"flag:1"`
@@ -4496,6 +4608,7 @@ func (*StatsMessageStats) CRC() uint32 {
 	return 0x7fe91c14
 }
 
+// Statistics for a poll sent in a message.
 type StatsPollStats struct {
 	VotesGraph StatsGraph
 }

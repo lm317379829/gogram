@@ -762,7 +762,7 @@ func (*AccountGetCollectibleEmojiStatusesParams) CRC() uint32 {
 	return 0x2e7b4543
 }
 
-// Obtain a list of emoji statuses for owned collectible gifts.
+// Obtain a list of emoji statuses for owned or hosted collectible gifts.
 func (c *Client) AccountGetCollectibleEmojiStatuses(hash int64) (AccountEmojiStatuses, error) {
 	responseData, err := c.MakeRequest(&AccountGetCollectibleEmojiStatusesParams{Hash: hash})
 	if err != nil {
@@ -1330,7 +1330,7 @@ func (*AccountGetUniqueGiftChatThemesParams) CRC() uint32 {
 	return 0xe42ce9c9
 }
 
-// Obtain all chat themes associated to owned collectible gifts.
+// Obtain all chat themes associated to owned or hosted collectible gifts.
 func (c *Client) AccountGetUniqueGiftChatThemes(offset string, limit int32, hash int64) (AccountChatThemes, error) {
 	responseData, err := c.MakeRequest(&AccountGetUniqueGiftChatThemesParams{
 		Hash:   hash,
@@ -3164,6 +3164,7 @@ func (*AicomposeCreateToneParams) FlagIndex() int {
 	return 0
 }
 
+// Create a new custom AI composer tone.
 func (c *Client) AicomposeCreateTone(displayAuthor bool, emojiID int64, title, prompt string) (AiComposeTone, error) {
 	responseData, err := c.MakeRequest(&AicomposeCreateToneParams{
 		DisplayAuthor: displayAuthor,
@@ -3190,6 +3191,7 @@ func (*AicomposeDeleteToneParams) CRC() uint32 {
 	return 0xdd39316a
 }
 
+// Permanently delete a custom AI composer tone created by the current user.
 func (c *Client) AicomposeDeleteTone(tone InputAiComposeTone) (bool, error) {
 	responseData, err := c.MakeRequest(&AicomposeDeleteToneParams{Tone: tone})
 	if err != nil {
@@ -3211,6 +3213,7 @@ func (*AicomposeGetToneParams) CRC() uint32 {
 	return 0xb2e8ba03
 }
 
+// Fetch information about a single AI composer tone, for example to resolve a shared tone deep link.
 func (c *Client) AicomposeGetTone(tone InputAiComposeTone) (AicomposeTones, error) {
 	responseData, err := c.MakeRequest(&AicomposeGetToneParams{Tone: tone})
 	if err != nil {
@@ -3233,6 +3236,7 @@ func (*AicomposeGetToneExampleParams) CRC() uint32 {
 	return 0xd1b4ab14
 }
 
+// Fetch an example showing how an AI composer tone rephrases a sample message, used as a preview in the tone picker.
 func (c *Client) AicomposeGetToneExample(tone InputAiComposeTone, num int32) (*AiComposeToneExample, error) {
 	responseData, err := c.MakeRequest(&AicomposeGetToneExampleParams{
 		Num:  num,
@@ -3257,6 +3261,7 @@ func (*AicomposeGetTonesParams) CRC() uint32 {
 	return 0xabd59201
 }
 
+// Fetch the list of saved AI composer tones of the current user.
 func (c *Client) AicomposeGetTones(hash int64) (AicomposeTones, error) {
 	responseData, err := c.MakeRequest(&AicomposeGetTonesParams{Hash: hash})
 	if err != nil {
@@ -3279,6 +3284,7 @@ func (*AicomposeSaveToneParams) CRC() uint32 {
 	return 0x1782cbb1
 }
 
+// Install or uninstall an AI composer tone, adding it to or removing it from the list of saved tones of the current user.
 func (c *Client) AicomposeSaveTone(tone InputAiComposeTone, unsave bool) (bool, error) {
 	responseData, err := c.MakeRequest(&AicomposeSaveToneParams{
 		Tone:   tone,
@@ -3311,6 +3317,7 @@ func (*AicomposeUpdateToneParams) FlagIndex() int {
 	return 0
 }
 
+// Edit a custom AI composer tone previously created by the current user. Only the fields whose flag is set will be modified.
 func (c *Client) AicomposeUpdateTone(params *AicomposeUpdateToneParams) (AiComposeTone, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -3357,7 +3364,7 @@ func (*AuthBindTempAuthKeyParams) CRC() uint32 {
 	return 0xcdd42a05
 }
 
-// Binds a temporary authorization key `temp_auth_key_id` to the permanent authorization key `perm_auth_key_id`. Each permanent key may only be bound to one temporary key at a time, binding a new temporary key overwrites the previous one.
+// Binds a temporary authorization key `temp_auth_key_id` to the permanent authorization key `perm_auth_key_id`.
 func (c *Client) AuthBindTempAuthKey(permAuthKeyID, nonce int64, expiresAt int32, encryptedMessage []byte) (bool, error) {
 	responseData, err := c.MakeRequest(&AuthBindTempAuthKeyParams{
 		EncryptedMessage: encryptedMessage,
@@ -4144,6 +4151,7 @@ func (*BotsCheckUsernameParams) CRC() uint32 {
 	return 0x87f2219b
 }
 
+// Check whether a username is available and valid for use when creating a managed bot.
 func (c *Client) BotsCheckUsername(username string) (bool, error) {
 	responseData, err := c.MakeRequest(&BotsCheckUsernameParams{Username: username})
 	if err != nil {
@@ -4172,6 +4180,7 @@ func (*BotsCreateBotParams) FlagIndex() int {
 	return 0
 }
 
+// Create a managed bot owned by the current user and controlled by the specified manager bot.
 func (c *Client) BotsCreateBot(viaDeeplink bool, name, username string, managerID InputUser) (User, error) {
 	responseData, err := c.MakeRequest(&BotsCreateBotParams{
 		ManagerID:   managerID,
@@ -4232,6 +4241,7 @@ func (*BotsEditAccessSettingsParams) FlagIndex() int {
 	return 0
 }
 
+// Edit the access restriction settings of a managed bot; can only be called by the manager bot.
 func (c *Client) BotsEditAccessSettings(restricted bool, bot InputUser, addUsers []InputUser) (bool, error) {
 	responseData, err := c.MakeRequest(&BotsEditAccessSettingsParams{
 		AddUsers:   addUsers,
@@ -4288,6 +4298,7 @@ func (*BotsExportBotTokenParams) CRC() uint32 {
 	return 0xbd0d99eb
 }
 
+// Export the bot token of a managed bot ; can only be called by the manager bot.
 func (c *Client) BotsExportBotToken(bot InputUser, revoke bool) (*BotsExportedBotToken, error) {
 	responseData, err := c.MakeRequest(&BotsExportBotTokenParams{
 		Bot:    bot,
@@ -4312,6 +4323,7 @@ func (*BotsGetAccessSettingsParams) CRC() uint32 {
 	return 0x213853a3
 }
 
+// Get the access restriction settings of a managed bot; can only be called by the manager bot.
 func (c *Client) BotsGetAccessSettings(bot InputUser) (*BotsAccessSettings, error) {
 	responseData, err := c.MakeRequest(&BotsGetAccessSettingsParams{Bot: bot})
 	if err != nil {
@@ -4528,6 +4540,7 @@ func (*BotsGetRequestedWebViewButtonParams) CRC() uint32 {
 	return 0xbf25b7f3
 }
 
+// Fetch the peer request button a bot prepared for a Mini App with bots.requestWebViewButton, invoked when the Mini App emits a `web_app_request_chat` event
 func (c *Client) BotsGetRequestedWebViewButton(bot InputUser, webappReqID string) (KeyboardButton, error) {
 	responseData, err := c.MakeRequest(&BotsGetRequestedWebViewButtonParams{
 		Bot:         bot,
@@ -4635,6 +4648,7 @@ func (*BotsRequestWebViewButtonParams) CRC() uint32 {
 	return 0x31a2a35e
 }
 
+// Bots may use this method to prepare a peer request button for a Mini App
 func (c *Client) BotsRequestWebViewButton(userID InputUser, button KeyboardButton) (*BotsRequestedButton, error) {
 	responseData, err := c.MakeRequest(&BotsRequestWebViewButtonParams{
 		Button: button,
@@ -5447,9 +5461,10 @@ func (c *Client) ChannelsGetAdminLog(params *ChannelsGetAdminLogParams) (*Channe
 }
 
 type ChannelsGetAdminedPublicChannelsParams struct {
-	ByLocation  bool `tl:"flag:0,encoded_in_bitflags"`
-	CheckLimit  bool `tl:"flag:1,encoded_in_bitflags"`
-	ForPersonal bool `tl:"flag:2,encoded_in_bitflags"`
+	ByLocation       bool `tl:"flag:0,encoded_in_bitflags"`
+	CheckLimit       bool `tl:"flag:1,encoded_in_bitflags"`
+	ForPersonal      bool `tl:"flag:2,encoded_in_bitflags"`
+	ForCommunityPeer bool `tl:"flag:3,encoded_in_bitflags"`
 }
 
 func (*ChannelsGetAdminedPublicChannelsParams) CRC() uint32 {
@@ -5461,11 +5476,12 @@ func (*ChannelsGetAdminedPublicChannelsParams) FlagIndex() int {
 }
 
 // Get channels/supergroups/geogroups we're admin in. Usually called when the user exceeds the limit for owned public channels/supergroups/geogroups, and the user is given the choice to remove one of his channels/supergroups/geogroups.
-func (c *Client) ChannelsGetAdminedPublicChannels(byLocation, checkLimit, forPersonal bool) (MessagesChats, error) {
+func (c *Client) ChannelsGetAdminedPublicChannels(byLocation, checkLimit, forPersonal, forCommunityPeer bool) (MessagesChats, error) {
 	responseData, err := c.MakeRequest(&ChannelsGetAdminedPublicChannelsParams{
-		ByLocation:  byLocation,
-		CheckLimit:  checkLimit,
-		ForPersonal: forPersonal,
+		ByLocation:       byLocation,
+		CheckLimit:       checkLimit,
+		ForCommunityPeer: forCommunityPeer,
+		ForPersonal:      forPersonal,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sending ChannelsGetAdminedPublicChannels: %w", err)
@@ -5734,7 +5750,7 @@ func (*ChannelsGetSendAsParams) FlagIndex() int {
 	return 0
 }
 
-// Obtains a list of peers that can be used to send messages in a specific group
+// Obtains a list of peers that can be displayed as the sender in a specific context. With `for_live_stories`, returns peers that may author live story in-call messages.
 func (c *Client) ChannelsGetSendAs(forPaidReactions, forLiveStories bool, peer InputPeer) (*ChannelsSendAsPeers, error) {
 	responseData, err := c.MakeRequest(&ChannelsGetSendAsParams{
 		ForLiveStories:   forLiveStories,
@@ -6840,6 +6856,259 @@ func (c *Client) ChatlistsLeaveChatlist(chatlist *InputChatlistDialogFilter, pee
 	return resp, nil
 }
 
+type CommunitiesCreateParams struct {
+	Hidden bool `tl:"flag:1,encoded_in_bitflags"`
+	Title  string
+	About  string `tl:"flag:0"`
+	Peer   InputPeer
+}
+
+func (*CommunitiesCreateParams) CRC() uint32 {
+	return 0xa63859ec
+}
+
+func (*CommunitiesCreateParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesCreate(hidden bool, title, about string, peer InputPeer) (Updates, error) {
+	responseData, err := c.MakeRequest(&CommunitiesCreateParams{
+		About:  about,
+		Hidden: hidden,
+		Peer:   peer,
+		Title:  title,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending CommunitiesCreate: %w", err)
+	}
+
+	resp, ok := responseData.(Updates)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesGetJoinedCommunitiesParams struct{}
+
+func (*CommunitiesGetJoinedCommunitiesParams) CRC() uint32 {
+	return 0xa663e830
+}
+
+func (c *Client) CommunitiesGetJoinedCommunities() (MessagesChats, error) {
+	responseData, err := c.MakeRequest(&CommunitiesGetJoinedCommunitiesParams{})
+	if err != nil {
+		return nil, fmt.Errorf("sending CommunitiesGetJoinedCommunities: %w", err)
+	}
+
+	resp, ok := responseData.(MessagesChats)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesGetParticipantJoinedChatsParams struct {
+	Community   InputChannel
+	Participant InputPeer
+}
+
+func (*CommunitiesGetParticipantJoinedChatsParams) CRC() uint32 {
+	return 0xf87eabab
+}
+
+func (c *Client) CommunitiesGetParticipantJoinedChats(community InputChannel, participant InputPeer) (*CommunitiesParticipantJoinedChats, error) {
+	responseData, err := c.MakeRequest(&CommunitiesGetParticipantJoinedChatsParams{
+		Community:   community,
+		Participant: participant,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending CommunitiesGetParticipantJoinedChats: %w", err)
+	}
+
+	resp, ok := responseData.(*CommunitiesParticipantJoinedChats)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesGetPeerLinkRequestsParams struct {
+	Community InputChannel
+	Offset    string
+	Limit     int32
+}
+
+func (*CommunitiesGetPeerLinkRequestsParams) CRC() uint32 {
+	return 0x93773344
+}
+
+func (c *Client) CommunitiesGetPeerLinkRequests(community InputChannel, offset string, limit int32) (*CommunitiesPeerLinkRequests, error) {
+	responseData, err := c.MakeRequest(&CommunitiesGetPeerLinkRequestsParams{
+		Community: community,
+		Limit:     limit,
+		Offset:    offset,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending CommunitiesGetPeerLinkRequests: %w", err)
+	}
+
+	resp, ok := responseData.(*CommunitiesPeerLinkRequests)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesToggleAllPeerLinkRequestApprovalParams struct {
+	Reject    bool `tl:"flag:0,encoded_in_bitflags"`
+	Community InputChannel
+}
+
+func (*CommunitiesToggleAllPeerLinkRequestApprovalParams) CRC() uint32 {
+	return 0xbfe3dd3d
+}
+
+func (*CommunitiesToggleAllPeerLinkRequestApprovalParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesToggleAllPeerLinkRequestApproval(reject bool, community InputChannel) (bool, error) {
+	responseData, err := c.MakeRequest(&CommunitiesToggleAllPeerLinkRequestApprovalParams{
+		Community: community,
+		Reject:    reject,
+	})
+	if err != nil {
+		return false, fmt.Errorf("sending CommunitiesToggleAllPeerLinkRequestApproval: %w", err)
+	}
+
+	resp, ok := responseData.(bool)
+	if !ok {
+		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesToggleCommunityCollapsedInDialogsParams struct {
+	Collapsed bool `tl:"flag:0,encoded_in_bitflags"`
+	Community InputChannel
+}
+
+func (*CommunitiesToggleCommunityCollapsedInDialogsParams) CRC() uint32 {
+	return 0xd766e3ea
+}
+
+func (*CommunitiesToggleCommunityCollapsedInDialogsParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesToggleCommunityCollapsedInDialogs(collapsed bool, community InputChannel) (Updates, error) {
+	responseData, err := c.MakeRequest(&CommunitiesToggleCommunityCollapsedInDialogsParams{
+		Collapsed: collapsed,
+		Community: community,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending CommunitiesToggleCommunityCollapsedInDialogs: %w", err)
+	}
+
+	resp, ok := responseData.(Updates)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesToggleParticipantBannedParams struct {
+	Unban       bool `tl:"flag:0,encoded_in_bitflags"`
+	Community   InputChannel
+	Participant InputPeer
+}
+
+func (*CommunitiesToggleParticipantBannedParams) CRC() uint32 {
+	return 0x9967ad0f
+}
+
+func (*CommunitiesToggleParticipantBannedParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesToggleParticipantBanned(unban bool, community InputChannel, participant InputPeer) (bool, error) {
+	responseData, err := c.MakeRequest(&CommunitiesToggleParticipantBannedParams{
+		Community:   community,
+		Participant: participant,
+		Unban:       unban,
+	})
+	if err != nil {
+		return false, fmt.Errorf("sending CommunitiesToggleParticipantBanned: %w", err)
+	}
+
+	resp, ok := responseData.(bool)
+	if !ok {
+		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesTogglePeerLinkParams struct {
+	Visible   bool `tl:"flag:0,encoded_in_bitflags"`
+	Hidden    bool `tl:"flag:1,encoded_in_bitflags"`
+	Deleted   bool `tl:"flag:2,encoded_in_bitflags"`
+	Community InputChannel
+	Peer      InputPeer
+}
+
+func (*CommunitiesTogglePeerLinkParams) CRC() uint32 {
+	return 0x736dcfea
+}
+
+func (*CommunitiesTogglePeerLinkParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesTogglePeerLink(params *CommunitiesTogglePeerLinkParams) (bool, error) {
+	responseData, err := c.MakeRequest(params)
+	if err != nil {
+		return false, fmt.Errorf("sending CommunitiesTogglePeerLink: %w", err)
+	}
+
+	resp, ok := responseData.(bool)
+	if !ok {
+		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type CommunitiesTogglePeerLinkRequestApprovalParams struct {
+	Reject    bool `tl:"flag:0,encoded_in_bitflags"`
+	Community InputChannel
+	Peer      InputPeer
+}
+
+func (*CommunitiesTogglePeerLinkRequestApprovalParams) CRC() uint32 {
+	return 0x8c8219a8
+}
+
+func (*CommunitiesTogglePeerLinkRequestApprovalParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) CommunitiesTogglePeerLinkRequestApproval(reject bool, community InputChannel, peer InputPeer) (bool, error) {
+	responseData, err := c.MakeRequest(&CommunitiesTogglePeerLinkRequestApprovalParams{
+		Community: community,
+		Peer:      peer,
+		Reject:    reject,
+	})
+	if err != nil {
+		return false, fmt.Errorf("sending CommunitiesTogglePeerLinkRequestApproval: %w", err)
+	}
+
+	resp, ok := responseData.(bool)
+	if !ok {
+		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
 type ContactsAcceptContactParams struct {
 	ID InputUser
 }
@@ -7553,6 +7822,127 @@ func (c *Client) ContactsUpdateContactNote(id InputUser, note *TextWithEntities)
 	resp, ok := responseData.(bool)
 	if !ok {
 		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type EphemeralDeleteMessageParams struct {
+	Peer       InputPeer
+	ReceiverID InputUser
+	ID         int32
+}
+
+func (*EphemeralDeleteMessageParams) CRC() uint32 {
+	return 0xa3c0d511
+}
+
+func (c *Client) EphemeralDeleteMessage(peer InputPeer, receiverID InputUser, id int32) (bool, error) {
+	responseData, err := c.MakeRequest(&EphemeralDeleteMessageParams{
+		ID:         id,
+		Peer:       peer,
+		ReceiverID: receiverID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("sending EphemeralDeleteMessage: %w", err)
+	}
+
+	resp, ok := responseData.(bool)
+	if !ok {
+		return false, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type EphemeralGetCallbackAnswerParams struct {
+	Peer InputPeer
+	ID   int32
+	Data []byte `tl:"flag:1"`
+}
+
+func (*EphemeralGetCallbackAnswerParams) CRC() uint32 {
+	return 0x3fa464c8
+}
+
+func (*EphemeralGetCallbackAnswerParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) EphemeralGetCallbackAnswer(peer InputPeer, id int32, data []byte) (*MessagesBotCallbackAnswer, error) {
+	responseData, err := c.MakeRequest(&EphemeralGetCallbackAnswerParams{
+		Data: data,
+		ID:   id,
+		Peer: peer,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending EphemeralGetCallbackAnswer: %w", err)
+	}
+
+	resp, ok := responseData.(*MessagesBotCallbackAnswer)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type EphemeralReportMessageParams struct {
+	Peer    InputPeer
+	ID      int32
+	Option  []byte
+	Message string
+}
+
+func (*EphemeralReportMessageParams) CRC() uint32 {
+	return 0x8704f2bf
+}
+
+func (c *Client) EphemeralReportMessage(peer InputPeer, id int32, option []byte, message string) (ReportResult, error) {
+	responseData, err := c.MakeRequest(&EphemeralReportMessageParams{
+		ID:      id,
+		Message: message,
+		Option:  option,
+		Peer:    peer,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending EphemeralReportMessage: %w", err)
+	}
+
+	resp, ok := responseData.(ReportResult)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type EphemeralSendMessageParams struct {
+	Peer        InputPeer
+	ReceiverID  InputUser
+	QueryID     int64 `tl:"flag:0"`
+	Message     string
+	Entities    []MessageEntity  `tl:"flag:1"`
+	Media       InputMedia       `tl:"flag:2"`
+	ReplyMarkup ReplyMarkup      `tl:"flag:3"`
+	RichMessage InputRichMessage `tl:"flag:4"`
+	RandomID    int64
+	ReplyTo     InputReplyTo `tl:"flag:5"`
+}
+
+func (*EphemeralSendMessageParams) CRC() uint32 {
+	return 0x68cbd09f
+}
+
+func (*EphemeralSendMessageParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) EphemeralSendMessage(params *EphemeralSendMessageParams) (Updates, error) {
+	responseData, err := c.MakeRequest(params)
+	if err != nil {
+		return nil, fmt.Errorf("sending EphemeralSendMessage: %w", err)
+	}
+
+	resp, ok := responseData.(Updates)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
 	}
 	return resp, nil
 }
@@ -8379,6 +8769,7 @@ func (*MessagesAddPollAnswerParams) CRC() uint32 {
 	return 0x19bc4b6d
 }
 
+// Add an answer option to an open-answer poll
 func (c *Client) MessagesAddPollAnswer(peer InputPeer, msgID int32, answer PollAnswer) (Updates, error) {
 	responseData, err := c.MakeRequest(&MessagesAddPollAnswerParams{
 		Answer: answer,
@@ -8666,6 +9057,35 @@ func (c *Client) MessagesComposeMessageWithAi(params *MessagesComposeMessageWith
 	return resp, nil
 }
 
+type MessagesComposeRichMessageWithAiParams struct {
+	Proofread       bool               `tl:"flag:0,encoded_in_bitflags"`
+	Emojify         bool               `tl:"flag:3,encoded_in_bitflags"`
+	Text            InputRichMessage   `tl:"flag:4"`
+	TranslateToLang string             `tl:"flag:1"`
+	Tone            InputAiComposeTone `tl:"flag:2"`
+}
+
+func (*MessagesComposeRichMessageWithAiParams) CRC() uint32 {
+	return 0x8d7ae6af
+}
+
+func (*MessagesComposeRichMessageWithAiParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) MessagesComposeRichMessageWithAi(params *MessagesComposeRichMessageWithAiParams) (*MessagesComposedRichMessageWithAi, error) {
+	responseData, err := c.MakeRequest(params)
+	if err != nil {
+		return nil, fmt.Errorf("sending MessagesComposeRichMessageWithAi: %w", err)
+	}
+
+	resp, ok := responseData.(*MessagesComposedRichMessageWithAi)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
 type MessagesCreateChatParams struct {
 	Users     []InputUser
 	Title     string
@@ -8929,6 +9349,7 @@ func (*MessagesDeleteParticipantReactionParams) CRC() uint32 {
 	return 0xe3b7f82c
 }
 
+// As an admin, remove all of a specific participant's reactions from a single message.
 func (c *Client) MessagesDeleteParticipantReaction(peer InputPeer, msgID int32, participant InputPeer) (Updates, error) {
 	responseData, err := c.MakeRequest(&MessagesDeleteParticipantReactionParams{
 		MsgID:       msgID,
@@ -8955,6 +9376,7 @@ func (*MessagesDeleteParticipantReactionsParams) CRC() uint32 {
 	return 0xa0b80cf8
 }
 
+// As an admin, remove all of a specific participant's reactions from every message in a group or channel.
 func (c *Client) MessagesDeleteParticipantReactions(peer, participant InputPeer) (bool, error) {
 	responseData, err := c.MakeRequest(&MessagesDeleteParticipantReactionsParams{
 		Participant: participant,
@@ -9007,6 +9429,7 @@ func (*MessagesDeletePollAnswerParams) CRC() uint32 {
 	return 0xac8505a5
 }
 
+// Remove an answer option from an open-answer poll
 func (c *Client) MessagesDeletePollAnswer(peer InputPeer, msgID int32, option []byte) (Updates, error) {
 	responseData, err := c.MakeRequest(&MessagesDeletePollAnswerParams{
 		MsgID:  msgID,
@@ -10264,6 +10687,7 @@ func (*MessagesGetEmojiGameInfoParams) CRC() uint32 {
 	return 0xfb7e8ca7
 }
 
+// Fetch dice game information.
 func (c *Client) MessagesGetEmojiGameInfo() (MessagesEmojiGameInfo, error) {
 	responseData, err := c.MakeRequest(&MessagesGetEmojiGameInfoParams{})
 	if err != nil {
@@ -11226,6 +11650,7 @@ func (*MessagesGetPersonalChannelHistoryParams) CRC() uint32 {
 	return 0x55fb0996
 }
 
+// Fetch the message history of a user's personal channel.
 func (c *Client) MessagesGetPersonalChannelHistory(userID InputUser, limit, maxID, minID int32, hash int64) (MessagesMessages, error) {
 	responseData, err := c.MakeRequest(&MessagesGetPersonalChannelHistoryParams{
 		Hash:   hash,
@@ -11435,7 +11860,7 @@ func (*MessagesGetRecentLocationsParams) CRC() uint32 {
 	return 0x702a40e0
 }
 
-// Get live location history of a certain user
+// Get all recent live locations sent to a specific chat: returns up to 1 location message (messageMediaGeoLive) per chat participant.
 func (c *Client) MessagesGetRecentLocations(peer InputPeer, limit int32, hash int64) (MessagesMessages, error) {
 	responseData, err := c.MakeRequest(&MessagesGetRecentLocationsParams{
 		Hash:  hash,
@@ -12056,6 +12481,7 @@ func (*MessagesGetUnreadPollVotesParams) FlagIndex() int {
 	return 0
 }
 
+// Get messages containing polls with unread votes
 func (c *Client) MessagesGetUnreadPollVotes(params *MessagesGetUnreadPollVotesParams) (MessagesMessages, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -12550,7 +12976,7 @@ func (*MessagesReadMentionsParams) FlagIndex() int {
 	return 0
 }
 
-// Mark mentions as read
+// Mark mentions as read; can be used in forums but cannot be used in monoforums.
 func (c *Client) MessagesReadMentions(peer InputPeer, topMsgID int32) (*MessagesAffectedHistory, error) {
 	responseData, err := c.MakeRequest(&MessagesReadMentionsParams{
 		Peer:     peer,
@@ -12602,6 +13028,7 @@ func (*MessagesReadPollVotesParams) FlagIndex() int {
 	return 0
 }
 
+// Mark all unread poll votes in a chat as read
 func (c *Client) MessagesReadPollVotes(peer InputPeer, topMsgID int32) (*MessagesAffectedHistory, error) {
 	responseData, err := c.MakeRequest(&MessagesReadPollVotesParams{
 		Peer:     peer,
@@ -12963,6 +13390,7 @@ func (*MessagesReportMusicListenParams) CRC() uint32 {
 	return 0xddbcd819
 }
 
+// Report the listening duration of a music track (audio document without the `voice` flag)
 func (c *Client) MessagesReportMusicListen(id InputDocument, listenedDuration int32) (bool, error) {
 	responseData, err := c.MakeRequest(&MessagesReportMusicListenParams{
 		ID:               id,
@@ -13016,6 +13444,7 @@ func (*MessagesReportReadMetricsParams) CRC() uint32 {
 	return 0x4067c5e6
 }
 
+// Report viewport read metrics for visible messages, indicating how long each message stayed in the chat viewport
 func (c *Client) MessagesReportReadMetrics(peer InputPeer, metrics []*InputMessageReadMetric) (bool, error) {
 	responseData, err := c.MakeRequest(&MessagesReportReadMetricsParams{
 		Metrics: metrics,
@@ -13104,6 +13533,37 @@ func (c *Client) MessagesRequestAppWebView(params *MessagesRequestAppWebViewPara
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
 		return nil, fmt.Errorf("sending MessagesRequestAppWebView: %w", err)
+	}
+
+	resp, ok := responseData.(*WebViewResultURL)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type MessagesRequestChatJoinWebViewParams struct {
+	QueryID     int64
+	ThemeParams *DataJson `tl:"flag:0"`
+	Platform    string
+}
+
+func (*MessagesRequestChatJoinWebViewParams) CRC() uint32 {
+	return 0xba9ee679
+}
+
+func (*MessagesRequestChatJoinWebViewParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) MessagesRequestChatJoinWebView(queryID int64, themeParams *DataJson, platform string) (*WebViewResultURL, error) {
+	responseData, err := c.MakeRequest(&MessagesRequestChatJoinWebViewParams{
+		Platform:    platform,
+		QueryID:     queryID,
+		ThemeParams: themeParams,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sending MessagesRequestChatJoinWebView: %w", err)
 	}
 
 	resp, ok := responseData.(*WebViewResultURL)
@@ -13524,10 +13984,11 @@ func (c *Client) MessagesSearchEmojiStickerSets(excludeFeatured bool, q string, 
 }
 
 type MessagesSearchGlobalParams struct {
-	BroadcastsOnly bool  `tl:"flag:1,encoded_in_bitflags"`
-	GroupsOnly     bool  `tl:"flag:2,encoded_in_bitflags"`
-	UsersOnly      bool  `tl:"flag:3,encoded_in_bitflags"`
-	FolderID       int32 `tl:"flag:0"`
+	BroadcastsOnly bool         `tl:"flag:1,encoded_in_bitflags"`
+	GroupsOnly     bool         `tl:"flag:2,encoded_in_bitflags"`
+	UsersOnly      bool         `tl:"flag:3,encoded_in_bitflags"`
+	FolderID       int32        `tl:"flag:0"`
+	Community      InputChannel `tl:"flag:4"`
 	Q              string
 	Filter         MessagesFilter
 	MinDate        int32
@@ -13539,7 +14000,7 @@ type MessagesSearchGlobalParams struct {
 }
 
 func (*MessagesSearchGlobalParams) CRC() uint32 {
-	return 0x4bc6589a
+	return 0x6126a43c
 }
 
 func (*MessagesSearchGlobalParams) FlagIndex() int {
@@ -14212,6 +14673,7 @@ func (*MessagesSetBotGuestChatResultParams) CRC() uint32 {
 	return 0xb8f106e3
 }
 
+// Bots may use this method to answer a guest mode query received via an updateBotGuestChatQuery update, providing the message to post into the chat as a guest
 func (c *Client) MessagesSetBotGuestChatResult(queryID int64, result InputBotInlineResult) (InputBotInlineMessageID, error) {
 	responseData, err := c.MakeRequest(&MessagesSetBotGuestChatResultParams{
 		QueryID: queryID,
@@ -15013,6 +15475,35 @@ func (c *Client) MessagesTranscribeAudio(peer InputPeer, msgID int32) (*Messages
 	}
 
 	resp, ok := responseData.(*MessagesTranscribedAudio)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
+	}
+	return resp, nil
+}
+
+type MessagesTranslateRichMessageParams struct {
+	Peer   InputPeer          `tl:"flag:0"`
+	ID     []int32            `tl:"flag:0"`
+	Text   []InputRichMessage `tl:"flag:1"`
+	ToLang string
+	Tone   string `tl:"flag:2"`
+}
+
+func (*MessagesTranslateRichMessageParams) CRC() uint32 {
+	return 0x1a542004
+}
+
+func (*MessagesTranslateRichMessageParams) FlagIndex() int {
+	return 0
+}
+
+func (c *Client) MessagesTranslateRichMessage(params *MessagesTranslateRichMessageParams) (*MessagesTranslatedRichMessage, error) {
+	responseData, err := c.MakeRequest(params)
+	if err != nil {
+		return nil, fmt.Errorf("sending MessagesTranslateRichMessage: %w", err)
+	}
+
+	resp, ok := responseData.(*MessagesTranslatedRichMessage)
 	if !ok {
 		return nil, fmt.Errorf("got invalid response type: %s", reflect.TypeOf(responseData))
 	}
@@ -16109,7 +16600,7 @@ func (*PaymentsGetSavedStarGiftsParams) FlagIndex() int {
 	return 0
 }
 
-// Fetch the full list of gifts owned by a peer.
+// Fetch the full list of gifts owned, received or hosted by a peer.
 func (c *Client) PaymentsGetSavedStarGifts(params *PaymentsGetSavedStarGiftsParams) (*PaymentsSavedStarGifts, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -16131,7 +16622,7 @@ func (*PaymentsGetStarGiftActiveAuctionsParams) CRC() uint32 {
 	return 0xa5d0514d
 }
 
-// Fetches all currently active gift auctions where the user has placed a bid.
+// Fetches all currently active gift auctions the user has ever bid on (including auctions where the user was outbid and their bid was returned), as long as the auction hasn't ended yet.
 func (c *Client) PaymentsGetStarGiftActiveAuctions(hash int64) (PaymentsStarGiftActiveAuctions, error) {
 	responseData, err := c.MakeRequest(&PaymentsGetStarGiftActiveAuctionsParams{Hash: hash})
 	if err != nil {
@@ -16789,7 +17280,7 @@ func (*PaymentsSaveStarGiftParams) FlagIndex() int {
 	return 0
 }
 
-// Display or remove a received gift from our profile.
+// Display or remove a received or hosted gift from our profile.
 func (c *Client) PaymentsSaveStarGift(unsave bool, stargift InputSavedStarGift) (bool, error) {
 	responseData, err := c.MakeRequest(&PaymentsSaveStarGiftParams{
 		Stargift: stargift,
@@ -17132,7 +17623,7 @@ func (*PhoneCheckGroupCallParams) CRC() uint32 {
 	return 0xb59cf977
 }
 
-// Check whether the group call Server Forwarding Unit is currently receiving the streams with the specified WebRTC source IDs. Returns an intersection of the source IDs specified in `sources`, and the source IDs currently being forwarded by the SFU.
+// Check which of the specified source IDs the server still recognizes as joined to a group call. This method can be used with all group call types
 func (c *Client) PhoneCheckGroupCall(call InputGroupCall, sources []int32) ([]int32, error) {
 	responseData, err := c.MakeRequest(&PhoneCheckGroupCallParams{
 		Call:    call,
@@ -17227,7 +17718,7 @@ func (*PhoneCreateGroupCallParams) FlagIndex() int {
 	return 0
 }
 
-// Create a group call or livestream.
+// Create a video chat or livestream
 func (c *Client) PhoneCreateGroupCall(params *PhoneCreateGroupCallParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -17307,7 +17798,7 @@ func (*PhoneDeleteGroupCallMessagesParams) FlagIndex() int {
 	return 0
 }
 
-// Delete messages from the in-call message overlay of a group call or livestream.
+// Delete specific messages from the in-call message overlay of a video chat/livestream or live story, including in RTMP mode.
 func (c *Client) PhoneDeleteGroupCallMessages(reportSpam bool, call InputGroupCall, messages []int32) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneDeleteGroupCallMessagesParams{
 		Call:       call,
@@ -17339,7 +17830,7 @@ func (*PhoneDeleteGroupCallParticipantMessagesParams) FlagIndex() int {
 	return 0
 }
 
-// Delete all messages from a specific participant in the in-call message overlay of a group call or livestream.
+// As an admin, delete all messages from a specific participant in the in-call message overlay of a video chat/livestream or live story, including in RTMP mode.
 func (c *Client) PhoneDeleteGroupCallParticipantMessages(reportSpam bool, call InputGroupCall, participant InputPeer) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneDeleteGroupCallParticipantMessagesParams{
 		Call:        call,
@@ -17395,7 +17886,7 @@ func (*PhoneDiscardGroupCallParams) CRC() uint32 {
 	return 0x7a777135
 }
 
-// Terminate a group call, ending the room for all participants.
+// Terminate a group call, ending the room for all participants. This method can be used with all group call types
 func (c *Client) PhoneDiscardGroupCall(call InputGroupCall) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneDiscardGroupCallParams{Call: call})
 	if err != nil {
@@ -17428,7 +17919,7 @@ func (*PhoneEditGroupCallParticipantParams) FlagIndex() int {
 	return 0
 }
 
-// Edit information about a given group call participant.
+// Edit information about a participant of a non-RTMP video chat/livestream or conference. The `raise_hand` field is only supported in video chats/livestreams
 func (c *Client) PhoneEditGroupCallParticipant(params *PhoneEditGroupCallParticipantParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -17451,7 +17942,7 @@ func (*PhoneEditGroupCallTitleParams) CRC() uint32 {
 	return 0x1ca6ac0a
 }
 
-// Edit the title of a group call or livestream.
+// Edit the title of a video chat or livestream. This method cannot be used with live stories or conferences
 func (c *Client) PhoneEditGroupCallTitle(call InputGroupCall, title string) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneEditGroupCallTitleParams{
 		Call:  call,
@@ -17481,7 +17972,7 @@ func (*PhoneExportGroupCallInviteParams) FlagIndex() int {
 	return 0
 }
 
-// Get an invite link for a video chat/livestream ; cannot be used for live stories or conference calls.
+// Get an invite link for a public video chat/livestream.
 func (c *Client) PhoneExportGroupCallInvite(canSelfUnmute bool, call InputGroupCall) (*PhoneExportedGroupCallInvite, error) {
 	responseData, err := c.MakeRequest(&PhoneExportGroupCallInviteParams{
 		Call:          call,
@@ -17555,7 +18046,7 @@ func (*PhoneGetGroupCallChainBlocksParams) CRC() uint32 {
 	return 0xee9f88a6
 }
 
-// Fetch the blocks of a conference blockchain, returns an updateGroupCallChainBlocks to be handled as specifiede here.
+// Fetch blocks from a conference call subchain ; handle the returned updateGroupCallChainBlocks as specified here.
 func (c *Client) PhoneGetGroupCallChainBlocks(call InputGroupCall, subChainID, offset, limit int32) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneGetGroupCallChainBlocksParams{
 		Call:       call,
@@ -17582,7 +18073,7 @@ func (*PhoneGetGroupCallJoinAsParams) CRC() uint32 {
 	return 0xef7c213a
 }
 
-// Get a list of peers that can be used to join a group call, presenting yourself as a specific user/channel.
+// Get a list of peers that can be used to join a video chat or livestream, presenting yourself as a specific user/channel.
 func (c *Client) PhoneGetGroupCallJoinAs(peer InputPeer) (*PhoneJoinAsPeers, error) {
 	responseData, err := c.MakeRequest(&PhoneGetGroupCallJoinAsParams{Peer: peer})
 	if err != nil {
@@ -17604,7 +18095,7 @@ func (*PhoneGetGroupCallStarsParams) CRC() uint32 {
 	return 0x6f636302
 }
 
-// Fetch the livestream donor and paid-message leaderboard.
+// Fetch a live story's total donations and top donors, see paid live story donations.
 func (c *Client) PhoneGetGroupCallStars(call InputGroupCall) (*PhoneGroupCallStars, error) {
 	responseData, err := c.MakeRequest(&PhoneGetGroupCallStarsParams{Call: call})
 	if err != nil {
@@ -17626,7 +18117,7 @@ func (*PhoneGetGroupCallStreamChannelsParams) CRC() uint32 {
 	return 0x1ab21940
 }
 
-// Get info about RTMP streams in a group call or livestream. This method should be invoked to the same group/channel-related DC used for downloading livestream chunks. As usual, the media DC is preferred, if available.
+// Get the available stream channels and current playback timestamp of an RTMP-mode video chat, livestream or live story The group call must be joined before invoking this method. Send the request to the media DC specified by groupCall.`stream_dc_id`.
 func (c *Client) PhoneGetGroupCallStreamChannels(call InputGroupCall) (*PhoneGroupCallStreamChannels, error) {
 	responseData, err := c.MakeRequest(&PhoneGetGroupCallStreamChannelsParams{Call: call})
 	if err != nil {
@@ -17654,7 +18145,7 @@ func (*PhoneGetGroupCallStreamRtmpURLParams) FlagIndex() int {
 	return 0
 }
 
-// Get RTMP URL and stream key for RTMP livestreams. Can be used even before creating the actual RTMP livestream with phone.createGroupCall (the `rtmp_stream` flag must be set).
+// Get the RTMP URL and stream key used by the single external streamer that publishes all audio and video for an RTMP-mode video chat, livestream or live story.
 func (c *Client) PhoneGetGroupCallStreamRtmpURL(liveStory bool, peer InputPeer, revoke bool) (*PhoneGroupCallStreamRtmpURL, error) {
 	responseData, err := c.MakeRequest(&PhoneGetGroupCallStreamRtmpURLParams{
 		LiveStory: liveStory,
@@ -17781,7 +18272,7 @@ func (*PhoneJoinGroupCallParams) FlagIndex() int {
 	return 0
 }
 
-// Join a group call
+// Join any group call type. Conference calls additionally require the E2E joining flow.
 func (c *Client) PhoneJoinGroupCall(params *PhoneJoinGroupCallParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -17804,7 +18295,7 @@ func (*PhoneJoinGroupCallPresentationParams) CRC() uint32 {
 	return 0xcbea6bc4
 }
 
-// Start screen sharing in a group call.
+// Start screen sharing in a non-RTMP video chat/livestream or conference. Presentations are not supported in live stories or RTMP-mode video chats/livestreams
 func (c *Client) PhoneJoinGroupCallPresentation(call InputGroupCall, params *DataJson) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneJoinGroupCallPresentationParams{
 		Call:   call,
@@ -17830,7 +18321,7 @@ func (*PhoneLeaveGroupCallParams) CRC() uint32 {
 	return 0x500377f9
 }
 
-// Leave a group call.
+// Leave a group call without ending it for other participants. This method can be used with all group call types
 func (c *Client) PhoneLeaveGroupCall(call InputGroupCall, source int32) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneLeaveGroupCallParams{
 		Call:   call,
@@ -17855,7 +18346,7 @@ func (*PhoneLeaveGroupCallPresentationParams) CRC() uint32 {
 	return 0x1c50d144
 }
 
-// Stop screen sharing in a group call.
+// Stop screen sharing in a non-RTMP video chat/livestream or conference. Presentations are not supported in live stories or RTMP-mode video chats/livestreams
 func (c *Client) PhoneLeaveGroupCallPresentation(call InputGroupCall) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneLeaveGroupCallPresentationParams{Call: call})
 	if err != nil {
@@ -17982,7 +18473,7 @@ func (*PhoneSaveDefaultGroupCallJoinAsParams) CRC() uint32 {
 	return 0x575e1f8c
 }
 
-// Set the default peer that will be used to join a group call in a specific dialog.
+// Set the default peer used to join a video chat/livestream associated with a specific dialog.
 func (c *Client) PhoneSaveDefaultGroupCallJoinAs(peer, joinAs InputPeer) (bool, error) {
 	responseData, err := c.MakeRequest(&PhoneSaveDefaultGroupCallJoinAsParams{
 		JoinAs: joinAs,
@@ -18008,6 +18499,7 @@ func (*PhoneSaveDefaultSendAsParams) CRC() uint32 {
 	return 0x4167add1
 }
 
+// Save the default peer displayed as the author of live story comments and reactions, see in-call messages.
 func (c *Client) PhoneSaveDefaultSendAs(call InputGroupCall, sendAs InputPeer) (bool, error) {
 	responseData, err := c.MakeRequest(&PhoneSaveDefaultSendAsParams{
 		Call:   call,
@@ -18033,7 +18525,7 @@ func (*PhoneSendConferenceCallBroadcastParams) CRC() uint32 {
 	return 0xc6701900
 }
 
-// Broadcast a blockchain block to all members of a conference call
+// Submit a verification message to conference call subchain `1`, see subchains.
 func (c *Client) PhoneSendConferenceCallBroadcast(call InputGroupCall, block []byte) (Updates, error) {
 	responseData, err := c.MakeRequest(&PhoneSendConferenceCallBroadcastParams{
 		Block: block,
@@ -18059,7 +18551,7 @@ func (*PhoneSendGroupCallEncryptedMessageParams) CRC() uint32 {
 	return 0xe5afa56d
 }
 
-// Send an E2E-encrypted message to all participants of a conference call, using the E2E encryption protocol.
+// Send an E2E-encrypted message or emoji reaction to all participants of a conference call. This method can only be used with conferences
 func (c *Client) PhoneSendGroupCallEncryptedMessage(call InputGroupCall, encryptedMessage []byte) (bool, error) {
 	responseData, err := c.MakeRequest(&PhoneSendGroupCallEncryptedMessageParams{
 		Call:             call,
@@ -18092,7 +18584,7 @@ func (*PhoneSendGroupCallMessageParams) FlagIndex() int {
 	return 0
 }
 
-// Send a transient in-call message to all participants of a group call or livestream.
+// Send an in-call message to all participants of a video chat/livestream or live story, including in RTMP mode
 func (c *Client) PhoneSendGroupCallMessage(params *PhoneSendGroupCallMessageParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -18204,7 +18696,7 @@ func (*PhoneToggleGroupCallRecordParams) FlagIndex() int {
 	return 0
 }
 
-// Start or stop recording a group call: the recorded audio and video streams will be automatically sent to `Saved messages` (the chat with ourselves).
+// Start or stop recording a video chat/livestream The recorded audio and video streams will be automatically sent to Saved Messages (the chat with ourselves).
 func (c *Client) PhoneToggleGroupCallRecord(params *PhoneToggleGroupCallRecordParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -18234,7 +18726,7 @@ func (*PhoneToggleGroupCallSettingsParams) FlagIndex() int {
 	return 0
 }
 
-// Change group call settings.
+// Change group call settings. Each setting supports different group call types
 func (c *Client) PhoneToggleGroupCallSettings(params *PhoneToggleGroupCallSettingsParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {
@@ -18847,6 +19339,7 @@ func (*StatsGetPollStatsParams) FlagIndex() int {
 	return 0
 }
 
+// Get statistics for a poll sent in a message.
 func (c *Client) StatsGetPollStats(dark bool, peer InputPeer, msgID int32) (*StatsPollStats, error) {
 	responseData, err := c.MakeRequest(&StatsGetPollStatsParams{
 		Dark:  dark,
@@ -19575,7 +20068,7 @@ func (*StoriesGetPeerMaxIDsParams) CRC() uint32 {
 	return 0x78499170
 }
 
-// Get the IDs of the maximum read stories for a set of peers.
+// Get compact active story summaries for a set of peers.
 func (c *Client) StoriesGetPeerMaxIDs(id []InputPeer) ([]*RecentStory, error) {
 	responseData, err := c.MakeRequest(&StoriesGetPeerMaxIDsParams{ID: id})
 	if err != nil {
@@ -20016,6 +20509,7 @@ func (*StoriesStartLiveParams) FlagIndex() int {
 	return 0
 }
 
+// Start a live story, optionally using RTMP livestream mode
 func (c *Client) StoriesStartLive(params *StoriesStartLiveParams) (Updates, error) {
 	responseData, err := c.MakeRequest(params)
 	if err != nil {

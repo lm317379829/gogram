@@ -99,43 +99,53 @@ const (
 	TransportHTTPS        = mtproto.TransportHTTPS
 )
 
+type TransportMode string
+
+const (
+	TransportModeAbridged           TransportMode = "Abridged"
+	TransportModeIntermediate       TransportMode = "Intermediate"
+	TransportModePaddedIntermediate TransportMode = "PaddedIntermediate"
+	TransportModeFull               TransportMode = "Full"
+)
+
 type ClientConfig struct {
-	AppID            int32                // Telegram API ID from my.telegram.org
-	AppHash          string               // Telegram API Hash from my.telegram.org
-	DeviceConfig     DeviceConfig         // Device and app identification settings
-	Session          string               // Path to session file for persistent auth
-	StringSession    string               // Base64 encoded session string (alternative to file)
-	SessionName      string               // Identifier for this session (used in log prefixes)
-	SessionAESKey    string               // AES-256 key for encrypting session file
-	ParseMode        string               // Default message parse mode: "HTML" or "Markdown"
-	MemorySession    bool                 // Keep session in memory only, don't persist to disk
-	DataCenter       int                  // Initial DC to connect to (1-5, default: 4)
-	IpAddr           string               // Custom DC IP address (overrides DataCenter)
-	PublicKeys       []*rsa.PublicKey     // RSA public keys for server verification
-	NoUpdates        bool                 // Disable update handling (bot-only mode)
-	DisableCache     bool                 // Disable peer/chat caching
-	TestMode         bool                 // Connect to Telegram test servers
-	LogLevel         LogLevel             // Logging verbosity (Trace, Debug, Info, Warn, Error)
-	Logger           Logger               // Custom logger implementation
-	Proxy            Proxy                // Proxy configuration (SOCKS5, HTTP, MTProxy)
-	LocalAddr        string               // Local network interface to bind (IP:port)
-	ForceIPv6        bool                 // Prefer IPv6 connections to Telegram
-	NoPreconnect     bool                 // Delay connection until Connect() is called
-	Cache            *CACHE               // Custom cache instance
-	CacheSenders     bool                 // Cache exported senders for file operations
-	TransportMode    string               // Wire protocol: "Abridged", "Intermediate", "Full", "PaddedIntermediate"
-	SleepThresholdMs int                  // Auto-sleep threshold for flood wait (ms)
-	AlbumWaitTime    int64                // Time to wait for grouped album messages (ms)
-	CommandPrefixes  string               // Bot command prefixes (default: "/!")
+	AppID            int32                                     // Telegram API ID from my.telegram.org
+	AppHash          string                                    // Telegram API Hash from my.telegram.org
+	DeviceConfig     DeviceConfig                              // Device and app identification settings
+	Session          string                                    // Path to session file for persistent auth
+	StringSession    string                                    // Base64 encoded session string (alternative to file)
+	SessionName      string                                    // Identifier for this session (used in log prefixes)
+	SessionAESKey    string                                    // AES-256 key for encrypting session file
+	ParseMode        string                                    // Default message parse mode: "HTML" or "Markdown"
+	MemorySession    bool                                      // Keep session in memory only, don't persist to disk
+	DataCenter       int                                       // Initial DC to connect to (1-5, default: 4)
+	IpAddr           string                                    // Custom DC IP address (overrides DataCenter)
+	PublicKeys       []*rsa.PublicKey                          // RSA public keys for server verification
+	NoUpdates        bool                                      // Disable update handling (bot-only mode)
+	DisableCache     bool                                      // Disable peer/chat caching
+	TestMode         bool                                      // Connect to Telegram test servers
+	LogLevel         LogLevel                                  // Logging verbosity (Trace, Debug, Info, Warn, Error)
+	Logger           Logger                                    // Custom logger implementation
+	Proxy            Proxy                                     // Proxy configuration (SOCKS5, HTTP, MTProxy)
+	LocalAddr        string                                    // Local network interface to bind (IP:port)
+	ForceIPv6        bool                                      // Prefer IPv6 connections to Telegram
+	NoPreconnect     bool                                      // Delay connection until Connect() is called
+	Cache            *CACHE                                    // Custom cache instance
+	CacheSenders     bool                                      // Cache exported senders for file operations
+	TransportMode    TransportMode                             // Wire protocol framing mode; defaults to TransportModeAbridged
+	SleepThresholdMs int                                       // Auto-sleep threshold for flood wait (ms)
+	AlbumWaitTime    int64                                     // Time to wait for grouped album messages (ms)
+	CommandPrefixes  string                                    // Bot command prefixes (default: "/!")
 	FloodHandler     func(ctx context.Context, err error) bool // Called on FLOOD_WAIT; return true to retry after wait
-	ErrorHandler     func(err error) bool // Called on request errors; return true to retry
-	Timeout          int                  // TCP connection timeout in seconds (default: 60)
-	ReqTimeout       int                  // RPC request timeout in seconds (default: 60)
-	Transport        TransportType        // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
-	HTTPPath         string               // HTTP request path (default "/api"; only used for HTTP/HTTPS)
-	EnablePFS        bool                 // Enable Perfect Forward Secrecy with temp auth keys
-	PFSKeyLifetime   int32                // Lifetime (seconds) for PFS temp key; 0 = 24h
-	DisableGapFetch  bool                 // Disable automatic gap filling, only fetch difference on UpdatesTooLong/UpdateChannelTooLong
+	ErrorHandler     func(err error) bool                      // Called on request errors; return true to retry
+	Timeout          int                                       // TCP connection timeout in seconds (default: 60)
+	ReqTimeout       int                                       // RPC request timeout in seconds (default: 60)
+	Transport        TransportType                             // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
+	Obfuscated       bool                                      // Wrap TCP transport with mtproto obfuscation (only meaningful for TransportTCP)
+	HTTPPath         string                                    // HTTP request path (default "/api"; only used for HTTP/HTTPS)
+	EnablePFS        bool                                      // Enable Perfect Forward Secrecy with temp auth keys
+	PFSKeyLifetime   int32                                     // Lifetime (seconds) for PFS temp key; 0 = 24h
+	DisableGapFetch  bool                                      // Disable automatic gap filling, only fetch difference on UpdatesTooLong/UpdateChannelTooLong
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -221,6 +231,8 @@ func (c *Client) setupMTProto(config ClientConfig) error {
 		Timeout:        config.Timeout,
 		ReqTimeout:     config.ReqTimeout,
 		Transport:      config.Transport,
+		Mode:           string(config.TransportMode),
+		Obfuscated:     config.Obfuscated,
 		HTTPPath:       config.HTTPPath,
 		EnablePFS:      config.EnablePFS,
 		PFSKeyLifetime: config.PFSKeyLifetime,
@@ -361,23 +373,32 @@ func (c *Client) InitialRequest() error {
 	if config, ok := serverConfig.(*Config); ok {
 		var dcs = make(map[int][]utils.DC)
 		var cdnDcs = make(map[int][]utils.DC)
+		var mediaDcs = make(map[int][]utils.DC)
 		for _, dc := range config.DcOptions {
-			if !dc.MediaOnly && !dc.Cdn {
-				if _, ok := dcs[int(dc.ID)]; !ok {
-					dcs[int(dc.ID)] = []utils.DC{}
-				}
-
-				dcs[int(dc.ID)] = append(dcs[int(dc.ID)], utils.DC{Addr: dc.IpAddress + ":" + strconv.Itoa(int(dc.Port)), IPv6: dc.Ipv6})
-			} else if dc.Cdn {
-				if _, ok := cdnDcs[int(dc.ID)]; !ok {
-					cdnDcs[int(dc.ID)] = []utils.DC{}
-				}
-
-				cdnDcs[int(dc.ID)] = append(cdnDcs[int(dc.ID)], utils.DC{Addr: dc.IpAddress + ":" + strconv.Itoa(int(dc.Port)), IPv6: dc.Ipv6})
+			entry := utils.DC{Addr: dc.IpAddress + ":" + strconv.Itoa(int(dc.Port)), IPv6: dc.Ipv6}
+			switch {
+			case dc.Cdn:
+				cdnDcs[int(dc.ID)] = append(cdnDcs[int(dc.ID)], entry)
+			case dc.MediaOnly:
+				mediaDcs[int(dc.ID)] = append(mediaDcs[int(dc.ID)], entry)
+			default:
+				dcs[int(dc.ID)] = append(dcs[int(dc.ID)], entry)
 			}
 		}
 
-		c.DcList.SetDCs(dcs, cdnDcs) // set the up to-date DC configuration for the library
+		c.DcList.SetAllDCs(dcs, cdnDcs, mediaDcs)
+
+		var mediaSummary []string
+		for id, addrs := range mediaDcs {
+			for _, a := range addrs {
+				mediaSummary = append(mediaSummary, fmt.Sprintf("DC%d=%s", id, a.Addr))
+			}
+		}
+		if len(mediaSummary) > 0 {
+			c.Log.Debug(fmt.Sprintf("server advertised media DCs: %v", mediaSummary))
+		} else {
+			c.Log.Debug("server advertised no media-only DCs")
+		}
 	}
 
 	return nil
@@ -419,7 +440,7 @@ func (c *Client) IsConnected() bool {
 }
 
 func (c *Client) Start() error {
-	c.MTProto.SetTerminated(false) // reset the terminated state
+	c.MTProto.SetTerminated(false)
 	if !c.IsConnected() {
 		if err := c.Connect(); err != nil {
 			return err
@@ -433,20 +454,44 @@ func (c *Client) Start() error {
 		return err
 	}
 
-	c.stopCh = make(chan struct{}) // reset the stop channel
+	c.resetBackground()
 	return nil
 }
 
 func (c *Client) St() error {
-	c.MTProto.SetTerminated(false) // reset the terminated state
+	c.MTProto.SetTerminated(false)
 	if !c.IsConnected() {
 		if err := c.Connect(); err != nil {
 			return err
 		}
 	}
 
-	c.stopCh = make(chan struct{}) // reset the stop channel
+	c.resetBackground()
 	return nil
+}
+
+func (c *Client) resetBackground() {
+	if c.stopCh != nil {
+		select {
+		case <-c.stopCh:
+			c.stopCh = make(chan struct{})
+		default:
+		}
+	} else {
+		c.stopCh = make(chan struct{})
+	}
+	if c.dispatcher != nil {
+		c.dispatcher.stopMu.Lock()
+		select {
+		case <-c.dispatcher.stopChan:
+			c.dispatcher.stopChan = make(chan struct{})
+		default:
+		}
+		c.dispatcher.stopMu.Unlock()
+	}
+	if c.exSenders != nil {
+		c.exSenders.ensureRunning()
+	}
 }
 
 // Returns true if the client is authorized as a user or a bot
@@ -461,7 +506,30 @@ func (c *Client) IsAuthorized() (bool, error) {
 
 // Disconnect from telegram servers
 func (c *Client) Disconnect() error {
+	c.shutdownBackground()
 	return c.MTProto.Disconnect()
+}
+
+func (c *Client) shutdownBackground() {
+	if c.stopCh != nil {
+		select {
+		case <-c.stopCh:
+		default:
+			close(c.stopCh)
+		}
+	}
+	if c.dispatcher != nil {
+		c.dispatcher.stopMu.Lock()
+		select {
+		case <-c.dispatcher.stopChan:
+		default:
+			close(c.dispatcher.stopChan)
+		}
+		c.dispatcher.stopMu.Unlock()
+	}
+	if c.exSenders != nil {
+		c.exSenders.Close()
+	}
 }
 
 // switchDC permanently switches the data center
@@ -498,7 +566,7 @@ type ExSenders struct {
 	sync.Mutex
 	senders     map[int][]*ExSender
 	cleanupDone chan struct{}
-	closeOnce   sync.Once
+	running     bool
 }
 
 type ExSender struct {
@@ -522,14 +590,26 @@ func (es *ExSender) GetLastUsedTime() time.Time {
 
 func NewExSenders() *ExSenders {
 	es := &ExSenders{
-		senders:     make(map[int][]*ExSender),
-		cleanupDone: make(chan struct{}),
+		senders: make(map[int][]*ExSender),
 	}
-	go es.cleanupLoop()
+	es.ensureRunning()
 	return es
 }
 
-func (es *ExSenders) cleanupLoop() {
+func (es *ExSenders) ensureRunning() {
+	es.Lock()
+	if es.running {
+		es.Unlock()
+		return
+	}
+	es.cleanupDone = make(chan struct{})
+	es.running = true
+	done := es.cleanupDone
+	es.Unlock()
+	go es.cleanupLoop(done)
+}
+
+func (es *ExSenders) cleanupLoop(done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 
@@ -537,7 +617,7 @@ func (es *ExSenders) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			es.cleanupIdleSenders()
-		case <-es.cleanupDone:
+		case <-done:
 			return
 		}
 	}
@@ -588,24 +668,39 @@ func (es *ExSenders) AddSender(dcID int, sender *ExSender) {
 }
 
 func (es *ExSenders) Close() {
-	es.closeOnce.Do(func() {
-		close(es.cleanupDone)
+	es.Lock()
+	if !es.running {
+		es.Unlock()
+		return
+	}
+	es.running = false
+	done := es.cleanupDone
+	es.cleanupDone = nil
+	senders := es.senders
+	es.senders = make(map[int][]*ExSender)
+	es.Unlock()
 
-		es.Lock()
-		defer es.Unlock()
-		for _, senders := range es.senders {
-			for _, sender := range senders {
-				if sender != nil {
-					sender.Terminate()
-				}
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+
+	for _, list := range senders {
+		for _, sender := range list {
+			if sender != nil {
+				sender.Terminate()
 			}
 		}
-		es.senders = make(map[int][]*ExSender)
-	})
+	}
 }
 
-// CreateExportedSender creates a new exported sender for the given DC
-func (c *Client) CreateExportedSender(dcID int, cdn bool, authParams ...*AuthExportedAuthorization) (*mtproto.MTProto, error) {
+// CreateExportedSender creates a new exported sender for the given DC.
+// When media is true, the sender targets the media-only DC for the given
+// DC ID when the server advertises one (falling back to the regular DC).
+func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams ...*AuthExportedAuthorization) (*mtproto.MTProto, error) {
 	if dcID <= 0 {
 		return nil, errors.New("invalid data center ID")
 	}
@@ -614,22 +709,26 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, authParams ...*AuthExp
 
 	var authParam = getVariadic(authParams, &AuthExportedAuthorization{})
 
-	c.Log.Debug("creating exported sender (DC%d)", dcID)
+	c.Log.Debug("creating exported sender (DC%d, cdn=%v, media=%v)", dcID, cdn, media)
 	if cdn {
 		if _, has := c.MTProto.HasCdnKey(int32(dcID)); !has {
 			cdnKeysResp, err := c.HelpGetCdnConfig()
 			if err != nil {
 				return nil, fmt.Errorf("getting cdn config: %w", err)
 			}
-
 			var cdnKeys = make(map[int32]*rsa.PublicKey)
 			for _, key := range cdnKeysResp.PublicKeys {
-				cdnKeys[key.DcID], _ = keys.ParsePublicKey(key.PublicKey)
+				parsed, perr := keys.ParsePublicKey(key.PublicKey)
+				if perr != nil {
+					continue
+				}
+				cdnKeys[key.DcID] = parsed
 			}
+			c.MTProto.SetCdnKeys(cdnKeys)
 		}
 	}
 
-	exported, err := c.MTProto.ExportNewSender(dcID, true, cdn)
+	exported, err := c.MTProto.ExportNewSender(dcID, true, cdn, media)
 	if err != nil {
 		return nil, fmt.Errorf("exporting new sender: %w", err)
 	}
@@ -642,6 +741,11 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, authParams ...*AuthExp
 			exported.Terminate()
 		}
 	}()
+
+	// no need invokeWithLayer for CDN DCs.
+	if cdn {
+		return exported, nil
+	}
 
 	for retry := 0; retry <= retryLimit; retry++ {
 		initialReq := &InitConnectionParams{
@@ -871,6 +975,7 @@ func (c *Client) SetCommandPrefixes(prefixes string) {
 
 // Terminate client and disconnect from telegram server
 func (c *Client) Terminate() error {
+	c.shutdownBackground()
 	return c.MTProto.Terminate()
 }
 
@@ -884,21 +989,15 @@ func (c *Client) Idle() {
 	case <-sigchan:
 		c.Stop()
 	case <-c.stopCh:
-		c.exSenders.Close()
 	}
 
+	c.shutdownBackground()
 	c.wg.Wait()
 }
 
 // Stop stops the client and disconnects from telegram server
 func (c *Client) Stop() error {
-	// close(c.stopCh)
-	select {
-	case <-c.stopCh:
-	default:
-		close(c.stopCh)
-	}
-
+	c.shutdownBackground()
 	return c.MTProto.Terminate()
 }
 
@@ -992,10 +1091,10 @@ func NewClientConfigBuilder(appID int32, appHash string) *ClientConfigBuilder {
 				SystemVersion: "iOS 26.0",
 				AppVersion:    Version,
 			},
-			DataCenter:    4,          // Default DC
-			ParseMode:     "HTML",     // Default parse mode
-			LogLevel:      InfoLevel,  // Default log level
-			TransportMode: "Abridged", // Default transport mode
+			DataCenter:    4,         // Default DC
+			ParseMode:     "HTML",    // Default parse mode
+			LogLevel:      InfoLevel, // Default log level
+			TransportMode: TransportModeAbridged,
 		},
 	}
 }
@@ -1110,7 +1209,7 @@ func (b *ClientConfigBuilder) WithSessionName(name string) *ClientConfigBuilder 
 	return b
 }
 
-func (b *ClientConfigBuilder) WithTransportMode(mode string) *ClientConfigBuilder {
+func (b *ClientConfigBuilder) WithTransportMode(mode TransportMode) *ClientConfigBuilder {
 	b.config.TransportMode = mode
 	return b
 }

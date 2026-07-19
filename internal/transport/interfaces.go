@@ -33,7 +33,8 @@ type CommonConfig struct {
 
 type TCPConnConfig struct {
 	CommonConfig
-	IpV6 bool
+	IpV6       bool
+	Obfuscated bool
 }
 
 type WSConnConfig struct {

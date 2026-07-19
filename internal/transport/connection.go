@@ -61,11 +61,40 @@ func NewTCP(cfg TCPConnConfig) (Conn, bool, error) {
 		cfg.Logger.Trace("[tcp] connected to %s", cfg.Host)
 	}
 
-	return &tcpConn{
+	tc := &tcpConn{
 		reader:  NewReader(cfg.Ctx, conn),
 		conn:    conn,
 		timeout: cfg.Timeout,
-	}, false, nil
+	}
+
+	if cfg.Obfuscated {
+		obf, err := NewObfuscatedConn(tc, ProtocolID(cfg.ModeVariant))
+		if err != nil {
+			tc.Close()
+			return nil, false, fmt.Errorf("obfuscating tcp: %w", err)
+		}
+		return &obfuscatedTCP{obf: obf, tc: tc, timeout: cfg.Timeout}, true, nil
+	}
+
+	return tc, false, nil
+}
+
+type obfuscatedTCP struct {
+	obf     *obfuscatedConn
+	tc      *tcpConn
+	timeout time.Duration
+}
+
+func (o *obfuscatedTCP) Read(b []byte) (int, error) {
+	return o.obf.Read(b)
+}
+
+func (o *obfuscatedTCP) Write(b []byte) (int, error) {
+	return o.obf.Write(b)
+}
+
+func (o *obfuscatedTCP) Close() error {
+	return o.tc.Close()
 }
 
 func newSocksTCP(cfg TCPConnConfig) (Conn, bool, error) {

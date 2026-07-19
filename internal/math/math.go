@@ -4,10 +4,13 @@ package math
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"math/big"
 	"math/bits"
+
+	ige "github.com/amarnathcjd/gogram/internal/aes_ige"
 )
 
 // DoRSAencrypt encrypts exactly one message block of size 255 bytes using the given public key.
@@ -27,6 +30,73 @@ func DoRSAencrypt(block []byte, key *rsa.PublicKey) ([]byte, error) {
 	copy(res, c.Bytes())
 
 	return res, nil
+}
+
+// DoRSAPad implements the RSA_PAD scheme used by modern Telegram DCs (all CDN
+// DCs, and required for MTProto 2.0 handshakes). Spec:
+// https://core.telegram.org/mtproto/auth_key
+func DoRSAPad(data []byte, key *rsa.PublicKey) ([]byte, error) {
+	if len(data) > 144 {
+		return nil, fmt.Errorf("DoRSAPad: data too long (%d > 144)", len(data))
+	}
+
+	dataWithPadding := make([]byte, 192)
+	copy(dataWithPadding, data)
+	if _, err := rand.Read(dataWithPadding[len(data):]); err != nil {
+		return nil, fmt.Errorf("DoRSAPad: rand for padding: %w", err)
+	}
+
+	dataPadReversed := make([]byte, 192)
+	for i, b := range dataWithPadding {
+		dataPadReversed[192-1-i] = b
+	}
+
+	for range 20 {
+		tempKey := make([]byte, 32)
+		if _, err := rand.Read(tempKey); err != nil {
+			return nil, fmt.Errorf("DoRSAPad: rand for temp_key: %w", err)
+		}
+
+		h := sha256.New()
+		h.Write(tempKey)
+		h.Write(dataWithPadding)
+		dataWithHash := make([]byte, 0, 224)
+		dataWithHash = append(dataWithHash, dataPadReversed...)
+		dataWithHash = append(dataWithHash, h.Sum(nil)...)
+
+		iv := make([]byte, 32)
+		cipher, err := ige.NewCipher(tempKey, iv)
+		if err != nil {
+			return nil, fmt.Errorf("DoRSAPad: aes cipher: %w", err)
+		}
+		aesEncrypted := make([]byte, 224)
+		if err := cipher.DoAES256IGEencrypt(dataWithHash, aesEncrypted); err != nil {
+			return nil, fmt.Errorf("DoRSAPad: aes encrypt: %w", err)
+		}
+
+		aesHash := sha256.Sum256(aesEncrypted)
+		tempKeyXor := make([]byte, 32)
+		for i := range tempKeyXor {
+			tempKeyXor[i] = tempKey[i] ^ aesHash[i]
+		}
+
+		keyAesEncrypted := make([]byte, 0, 256)
+		keyAesEncrypted = append(keyAesEncrypted, tempKeyXor...)
+		keyAesEncrypted = append(keyAesEncrypted, aesEncrypted...)
+
+		z := big.NewInt(0).SetBytes(keyAesEncrypted)
+		if z.Cmp(key.N) >= 0 {
+			continue
+		}
+
+		exponent := big.NewInt(int64(key.E))
+		c := big.NewInt(0).Exp(z, exponent, key.N)
+		res := make([]byte, 256)
+		cBytes := c.Bytes()
+		copy(res[256-len(cBytes):], cBytes)
+		return res, nil
+	}
+	return nil, fmt.Errorf("DoRSAPad: exhausted retries generating key_aes_encrypted < N")
 }
 
 func MakeGAB(g int32, g_a, dh_prime *big.Int) (b, g_b, g_ab *big.Int) {

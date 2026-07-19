@@ -284,7 +284,7 @@ func (d *Decoder) PopMessage() []byte {
 		realSize = int(uint32(sizeBuf[0]) | uint32(sizeBuf[1])<<8 | uint32(sizeBuf[2])<<16)
 		lenNumberSize = WordLen
 	}
-	
+
 	if realSize > d.buf.Len() {
 		d.err = fmt.Errorf("message size %d exceeds remaining input %d", realSize, d.buf.Len())
 		return nil

@@ -36,20 +36,20 @@ func (p StoryPrivacy) toRules(allowedUsers []InputUser) []InputPrivacyRule {
 }
 
 type StoryOptions struct {
-	Caption       string
-	ParseMode     string
-	Period        time.Duration
-	Privacy       StoryPrivacy
-	AllowedUsers  []InputUser
-	PrivacyRules  []InputPrivacyRule
-	Pinned        bool
-	Noforwards    bool
-	MediaAreas    []MediaArea
-	Music         InputDocument
-	Albums        []int32
-	FwdFromPeer   any
-	FwdFromStory  int32
-	Upload        *UploadOptions
+	Caption      string
+	ParseMode    string
+	Period       time.Duration
+	Privacy      StoryPrivacy
+	AllowedUsers []InputUser
+	PrivacyRules []InputPrivacyRule
+	Pinned       bool
+	Noforwards   bool
+	MediaAreas   []MediaArea
+	Music        InputDocument
+	Albums       []int32
+	FwdFromPeer  any
+	FwdFromStory int32
+	Upload       *UploadOptions
 }
 
 func (c *Client) SendStory(peerID, media any, opts ...*StoryOptions) (int32, error) {

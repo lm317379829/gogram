@@ -6,7 +6,7 @@
     <b>modern golang library for mtproto</b>
     <br>
     <b>
-    <a href="https://gogramdoc.vercel.app">documentation</a>
+    <a href="https://gogram.sbs">documentation</a>
     &nbsp;•&nbsp;
     <a href="https://github.com/amarnathcjd/gogram/releases">releases</a>
     &nbsp;•&nbsp;
