@@ -140,6 +140,14 @@ func (wp *WorkerPool) Close() {
 	wp.Lock()
 	defer wp.Unlock()
 
+	// Terminate all workers' underlying TCP connections to prevent
+	// orphaned connections from occupying Telegram's connection quota.
+	for _, w := range wp.workers {
+		if w != nil {
+			w.Terminate()
+		}
+	}
+
 	// Drain the free channel
 	for {
 		select {

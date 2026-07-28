@@ -5,6 +5,7 @@ package telegram
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"errors"
@@ -59,6 +60,7 @@ func (c *Client) GetChatPhoto(chatID any) (Photo, error) {
 func (c *Client) JoinChannel(channel any) (*Channel, error) {
 	switch p := channel.(type) {
 	case string:
+		p = strings.TrimSpace(p)
 		if TgJoinRe.MatchString(p) {
 			match := TgJoinRe.FindStringSubmatch(p)[1]
 			result, err := c.MessagesImportChatInvite(match)
@@ -99,8 +101,7 @@ func (c *Client) JoinChannel(channel any) (*Channel, error) {
 	case *InputPeerChannel, *InputPeerChat, int, int32, int64:
 		return c.joinChannelByPeer(p)
 	case *ChatInviteExported:
-		_, err := c.MessagesImportChatInvite(p.Link)
-		return nil, err
+		return c.JoinChannel(p.Link)
 	default:
 		return c.joinChannelByPeer(channel)
 	}
