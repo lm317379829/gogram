@@ -140,13 +140,8 @@ func (wp *WorkerPool) Close() {
 	wp.Lock()
 	defer wp.Unlock()
 
-	// Terminate all workers' underlying TCP connections to prevent
-	// orphaned connections from occupying Telegram's connection quota.
-	for _, w := range wp.workers {
-		if w != nil {
-			w.Terminate()
-		}
-	}
+	// Do not terminate workers here, as they are borrowed from the global ExSenders pool
+	// which manages their lifecycle and terminates them when idle.
 
 	// Drain the free channel
 	for {
@@ -1603,6 +1598,11 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 	}
 	defer pool.FreeWorker(sender)
 
+	// 如果刚拿到的 worker 已经处于断连状态，直接抛出致命错误，交由外层(TGBot)处理重连逻辑
+	if !sender.MTProto.IsTcpActive() {
+		return downloadResult{}, ErrWorkerTCPDead
+	}
+
 	request := j.makeGetFileRequest(part)
 	response, err := sender.MakeRequestCtx(reqCtx, request)
 	if j.opts.Delay > 0 {
@@ -1612,14 +1612,20 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 	}
 	if err != nil {
 		msg := err.Error()
-		switch {
-		case !sender.MTProto.IsTcpActive():
-			_ = sender.Reconnect(false)
-		case strings.Contains(msg, "deadline exceeded"),
-			strings.Contains(msg, "timeout"),
-			strings.Contains(msg, "connection reset"),
-			strings.Contains(msg, "broken pipe"),
-			strings.Contains(msg, "EOF"):
+		
+		// 检查是否为断连错误：TCP 状态为非活跃，或者包含了典型的连接断开报错
+		isDisconnected := !sender.MTProto.IsTcpActive() ||
+			strings.Contains(msg, "connection reset") ||
+			strings.Contains(msg, "broken pipe") ||
+			strings.Contains(msg, "EOF")
+
+		if isDisconnected {
+			// 直接返回 ErrWorkerTCPDead 致命错误，阻止 fetchPartLoop 内的 20 次盲目重试，交由外部 TGBot 调度处理
+			j.log.recordFailure(part.index, err, sender)
+			return downloadResult{}, ErrWorkerTCPDead
+		}
+
+		if strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout") {
 			_ = sender.Redial()
 		}
 		j.log.recordFailure(part.index, err, sender)
