@@ -5,6 +5,7 @@ package telegram
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"time"
 
