@@ -816,7 +816,11 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 				auth, err = c.exportAuthAuthorization(ctx, int32(exported.GetDC()))
 				if err != nil {
 					lastError = fmt.Errorf("exporting auth: %w", err)
-					c.Log.Error("failed to export authorization: %s", lastError.Error())
+					if errors.Is(err, context.Canceled) {
+						c.Log.Debug("authorization export aborted: %s", lastError.Error())
+					} else {
+						c.Log.Error("failed to export authorization: %s", lastError.Error())
+					}
 					continue
 				}
 
@@ -905,8 +909,6 @@ func (c *Client) acquireDownloadSender(ctx context.Context, dc int) (*downloadSe
 		dc = c.GetDC()
 	}
 
-	var toTerminate *mtproto.MTProto
-
 	c.downloadSendersMu.Lock()
 	if r, ok := c.downloadSenders[dc]; ok {
 		if r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
@@ -914,17 +916,11 @@ func (c *Client) acquireDownloadSender(ctx context.Context, dc int) (*downloadSe
 			c.downloadSendersMu.Unlock()
 			return r, nil
 		}
-		// dead entry: drop it and rebuild below
-		if r.sender != nil {
-			toTerminate = r.sender.MTProto
-		}
+		// dead entry: drop it. Do NOT terminate here — in-flight holders may
+		// still reference this sender; the last holder terminates it on release.
 		delete(c.downloadSenders, dc)
 	}
 	c.downloadSendersMu.Unlock()
-
-	if toTerminate != nil {
-		_ = toTerminate.Terminate()
-	}
 
 	conn, err := c.createExportedSender(ctx, dc, false, false)
 	if err != nil || conn == nil {
@@ -955,11 +951,22 @@ func (c *Client) releaseDownloadSender(ref *downloadSenderRef) {
 	if ref == nil {
 		return
 	}
+	var dead *mtproto.MTProto
 	c.downloadSendersMu.Lock()
 	if ref.refs > 0 {
 		ref.refs--
 	}
+	if ref.refs == 0 && c.downloadSenders[ref.dc] != ref {
+		// last holder of a sender that has left the registry (dead/replaced):
+		// terminate it so its connection is released
+		if ref.sender != nil {
+			dead = ref.sender.MTProto
+		}
+	}
 	c.downloadSendersMu.Unlock()
+	if dead != nil {
+		_ = dead.Terminate()
+	}
 }
 
 func (c *Client) GetExportedSendersStatus() map[int]int {
