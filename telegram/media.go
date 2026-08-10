@@ -83,6 +83,9 @@ func (wp *WorkerPool) Next() *ExSender {
 func (wp *WorkerPool) NextWithContext(ctx context.Context) *ExSender {
 	select {
 	case next := <-wp.free:
+		if next.MTProto == nil {
+			return nil
+		}
 		if !next.MTProto.IsTcpActive() {
 			done := make(chan struct{})
 			go func() {
@@ -157,7 +160,9 @@ func (wp *WorkerPool) Close() {
 		default:
 			wp.workers = nil
 			for _, s := range owned {
-				_ = s.Terminate()
+				if s.MTProto != nil {
+					_ = s.Terminate()
+				}
 			}
 			return
 		}
@@ -1595,7 +1600,7 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 		pool.Lock()
 		allDead := len(pool.workers) > 0
 		for _, w := range pool.workers {
-			if w.MTProto.IsTcpActive() {
+			if w.MTProto != nil && w.MTProto.IsTcpActive() {
 				allDead = false
 				break
 			}
@@ -2115,8 +2120,11 @@ func (c *Client) NewDownloadPool(dc int32) (*WorkerPool, error) {
 	pool := NewWorkerPool(1)
 	pool.owns = true
 	conn, err := c.CreateExportedSender(int(dc), false, false)
-	if err != nil {
+	if err != nil || conn == nil {
 		pool.Close()
+		if err == nil {
+			err = errors.New("nil exported sender")
+		}
 		return nil, fmt.Errorf("initialize download pool for DC%d: %w", dc, err)
 	}
 	pool.AddWorker(NewExSender(conn))

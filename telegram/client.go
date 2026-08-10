@@ -853,6 +853,9 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 		return exported, nil
 	}
 
+	if lastError == nil {
+		lastError = errors.New("exported sender initialization failed after retries")
+	}
 	return nil, lastError
 }
 
