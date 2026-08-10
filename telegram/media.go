@@ -91,12 +91,16 @@ func (wp *WorkerPool) NextWithContext(ctx context.Context) *ExSender {
 		if !next.MTProto.IsTcpActive() {
 			done := make(chan struct{})
 			go func() {
-				_ = next.Reconnect(false)
+				next.ensureAlive(context.Background())
 				close(done)
 			}()
 			select {
 			case <-done:
-				// Reconnect finished; caller's MakeRequestCtx will detect actual state.
+				// Reconnect finished; hand out the worker only if it is usable
+				// again, otherwise let the caller treat it as dead.
+				if !next.MTProto.IsTcpActive() {
+					return nil
+				}
 			case <-ctx.Done():
 				// Caller gave up. Wait for reconnect to finish, then only
 				// return worker to pool if it's actually active again.
@@ -1713,6 +1717,7 @@ func (j *downloadJob) cdnPool(_ context.Context, dc int32) (*WorkerPool, error) 
 		return nil, fmt.Errorf("creating cdn sender: %w", err)
 	}
 	pool := NewWorkerPool(1)
+	pool.owns = true
 	pool.AddWorker(NewExSender(conn))
 	j.cdnPools[dc] = pool
 	return pool, nil
@@ -1923,36 +1928,8 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 		}
 	}
 
-	var authParams = &AuthExportedAuthorization{}
-	if dc != int32(c.GetDC()) {
-		c.exportedKeysMu.Lock()
-		if c.exportedKeys == nil {
-			c.exportedKeys = make(map[int]*AuthExportedAuthorization)
-		}
-
-		if exportedKey, ok := c.exportedKeys[int(dc)]; ok {
-			authParams = exportedKey
-			c.exportedKeysMu.Unlock()
-		} else {
-			c.exportedKeysMu.Unlock()
-			auth, err := c.AuthExportAuthorization(dc)
-			if err != nil {
-				return err
-			}
-
-			authParams = &AuthExportedAuthorization{
-				ID:    auth.ID,
-				Bytes: auth.Bytes,
-			}
-
-			c.exportedKeysMu.Lock()
-			c.exportedKeys[int(dc)] = authParams
-			c.exportedKeysMu.Unlock()
-		}
-	}
-
-	createSender := func(authParams *AuthExportedAuthorization) (*mtproto.MTProto, error) {
-		return c.CreateExportedSender(int(dc), false, media, authParams)
+	createSender := func() (*mtproto.MTProto, error) {
+		return c.CreateExportedSender(int(dc), false, media)
 	}
 
 	cacheKey := int(dc)
@@ -1971,7 +1948,7 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 	}
 
 	if numCreate == 0 {
-		conn, err := createSender(authParams)
+		conn, err := createSender()
 		if err != nil {
 			return fmt.Errorf("creating initial sender: %w", err)
 		}
@@ -1995,7 +1972,7 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 				if bgCtx.Err() != nil {
 					return
 				}
-				conn, err := createSender(authParams)
+				conn, err := createSender()
 				if conn != nil && err == nil {
 					sender := NewExSender(conn)
 					c.exSenders.AddSender(cacheKey, sender)

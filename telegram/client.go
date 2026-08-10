@@ -74,12 +74,12 @@ type Client struct {
 	stopCh         chan struct{}
 	exSenders      *ExSenders
 	secretChats    *e2e.SecretChatManager
-	exportedKeys   map[int]*AuthExportedAuthorization
-	exportedKeysMu sync.Mutex
+	exportedKeys    map[int]*AuthExportedAuthorization
+	exportingKeys   map[int]chan struct{}
+	exportedKeysMu  sync.Mutex
 	Log            Logger
 
-	downloadSendersMu sync.Mutex
-	downloadSenders   map[int]*downloadSenderRef
+	downloadSenders *downloadSenderCache
 }
 
 type DeviceConfig struct {
@@ -204,7 +204,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 
 	client.exSenders = NewExSenders()
-	client.downloadSenders = make(map[int]*downloadSenderRef)
+	client.downloadSenders = newDownloadSenderCache()
 
 	return client, nil
 }
@@ -529,6 +529,9 @@ func (c *Client) resetBackground() {
 	if c.exSenders != nil {
 		c.exSenders.ensureRunning()
 	}
+	if c.downloadSenders != nil {
+		c.downloadSenders.ensureRunning()
+	}
 }
 
 // Returns true if the client is authorized as a user or a bot
@@ -566,6 +569,9 @@ func (c *Client) shutdownBackground() {
 	}
 	if c.exSenders != nil {
 		c.exSenders.Close()
+	}
+	if c.downloadSenders != nil {
+		c.downloadSenders.Close()
 	}
 }
 
@@ -608,8 +614,10 @@ type ExSenders struct {
 
 type ExSender struct {
 	*mtproto.MTProto
-	lastUsed   time.Time
-	lastUsedMu sync.Mutex
+	lastUsed     time.Time
+	lastUsedMu   sync.Mutex
+	reconnectMu  sync.Mutex
+	reconnecting chan struct{}
 }
 
 func NewExSender(mtProto *mtproto.MTProto) *ExSender {
@@ -617,6 +625,51 @@ func NewExSender(mtProto *mtproto.MTProto) *ExSender {
 		MTProto:  mtProto,
 		lastUsed: time.Now(),
 	}
+}
+
+// ensureAlive coordinates reconnection across every pool sharing this sender:
+// the first caller performs the reconnect while concurrent callers wait for it
+// to finish, then re-check liveness. Reports whether the sender is usable after.
+func (s *ExSender) ensureAlive(ctx context.Context) bool {
+	if s.MTProto == nil {
+		return false
+	}
+	if s.MTProto.IsTcpActive() {
+		return true
+	}
+
+	s.reconnectMu.Lock()
+	if s.reconnecting != nil {
+		done := s.reconnecting
+		s.reconnectMu.Unlock()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			select {
+			case <-done:
+			default:
+				return false
+			}
+		}
+		s.reconnectMu.Lock()
+		alive := s.MTProto != nil && s.MTProto.IsTcpActive()
+		s.reconnectMu.Unlock()
+		return alive
+	}
+
+	s.reconnecting = make(chan struct{})
+	done := s.reconnecting
+	s.reconnectMu.Unlock()
+
+	_ = s.Reconnect(false)
+	alive := s.MTProto != nil && s.MTProto.IsTcpActive()
+
+	s.reconnectMu.Lock()
+	s.reconnecting = nil
+	close(done)
+	s.reconnectMu.Unlock()
+	return alive
 }
 
 func (es *ExSender) GetLastUsedTime() time.Time {
@@ -813,7 +866,7 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 				}
 			} else {
 				c.Log.Info("exporting auth (DC%d)", dcID)
-				auth, err = c.exportAuthAuthorization(ctx, int32(exported.GetDC()))
+				auth, err = c.getExportedAuthorization(ctx, int32(exported.GetDC()))
 				if err != nil {
 					lastError = fmt.Errorf("exporting auth: %w", err)
 					if errors.Is(err, context.Canceled) {
@@ -823,13 +876,6 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 					}
 					continue
 				}
-
-				c.exportedKeysMu.Lock()
-				if c.exportedKeys == nil {
-					c.exportedKeys = make(map[int]*AuthExportedAuthorization)
-				}
-				c.exportedKeys[dcID] = auth
-				c.exportedKeysMu.Unlock()
 			}
 
 			initialReq.Query = &AuthImportAuthorizationParams{
@@ -894,10 +940,140 @@ func (c *Client) exportAuthAuthorization(ctx context.Context, dcID int32) (*Auth
 	return resp, nil
 }
 
+// getExportedAuthorization returns the cached exported authorization for the
+// given DC, exporting it exactly once across concurrent callers.
+func (c *Client) getExportedAuthorization(ctx context.Context, dcID int32) (*AuthExportedAuthorization, error) {
+	c.exportedKeysMu.Lock()
+	if c.exportedKeys == nil {
+		c.exportedKeys = make(map[int]*AuthExportedAuthorization)
+	}
+	if auth, ok := c.exportedKeys[int(dcID)]; ok {
+		c.exportedKeysMu.Unlock()
+		return auth, nil
+	}
+	if c.exportingKeys == nil {
+		c.exportingKeys = make(map[int]chan struct{})
+	}
+	if inFlight, ok := c.exportingKeys[int(dcID)]; ok {
+		c.exportedKeysMu.Unlock()
+		select {
+		case <-inFlight:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		c.exportedKeysMu.Lock()
+		defer c.exportedKeysMu.Unlock()
+		if auth, ok := c.exportedKeys[int(dcID)]; ok {
+			return auth, nil
+		}
+		return nil, errors.New("concurrent authorization export failed")
+	}
+	done := make(chan struct{})
+	c.exportingKeys[int(dcID)] = done
+	c.exportedKeysMu.Unlock()
+
+	auth, err := c.exportAuthAuthorization(ctx, dcID)
+
+	c.exportedKeysMu.Lock()
+	delete(c.exportingKeys, int(dcID))
+	if err == nil {
+		if c.exportedKeys == nil {
+			c.exportedKeys = make(map[int]*AuthExportedAuthorization)
+		}
+		c.exportedKeys[int(dcID)] = auth
+	}
+	close(done)
+	c.exportedKeysMu.Unlock()
+	return auth, err
+}
+
 type downloadSenderRef struct {
-	dc     int
-	sender *ExSender
-	refs   int
+	dc       int
+	sender   *ExSender
+	refs     int
+	lastUsed time.Time
+}
+
+type downloadSenderCache struct {
+	sync.Mutex
+	senders map[int]*downloadSenderRef
+	done    chan struct{}
+	running bool
+}
+
+func newDownloadSenderCache() *downloadSenderCache {
+	sc := &downloadSenderCache{senders: make(map[int]*downloadSenderRef)}
+	sc.ensureRunning()
+	return sc
+}
+
+func (sc *downloadSenderCache) ensureRunning() {
+	sc.Lock()
+	if sc.running {
+		sc.Unlock()
+		return
+	}
+	sc.done = make(chan struct{})
+	sc.running = true
+	done := sc.done
+	sc.Unlock()
+	go sc.cleanupLoop(done)
+}
+
+func (sc *downloadSenderCache) cleanupLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			sc.cleanupIdle()
+		case <-done:
+			return
+		}
+	}
+}
+
+func (sc *downloadSenderCache) cleanupIdle() {
+	sc.Lock()
+	defer sc.Unlock()
+
+	for dc, ref := range sc.senders {
+		if ref.refs == 0 && time.Since(ref.lastUsed) > 30*time.Minute {
+			delete(sc.senders, dc)
+			if ref.sender != nil && ref.sender.MTProto != nil {
+				_ = ref.sender.MTProto.Terminate()
+			}
+		}
+	}
+}
+
+func (sc *downloadSenderCache) Close() {
+	sc.Lock()
+	if !sc.running {
+		sc.Unlock()
+		return
+	}
+	sc.running = false
+	done := sc.done
+	sc.done = nil
+	senders := sc.senders
+	sc.senders = make(map[int]*downloadSenderRef)
+	sc.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+
+	for _, ref := range senders {
+		if ref != nil && ref.sender != nil && ref.sender.MTProto != nil {
+			_ = ref.sender.MTProto.Terminate()
+		}
+	}
 }
 
 // acquireDownloadSender returns the shared download sender for the given DC,
@@ -909,18 +1085,19 @@ func (c *Client) acquireDownloadSender(ctx context.Context, dc int) (*downloadSe
 		dc = c.GetDC()
 	}
 
-	c.downloadSendersMu.Lock()
-	if r, ok := c.downloadSenders[dc]; ok {
+	c.downloadSenders.Lock()
+	if r, ok := c.downloadSenders.senders[dc]; ok {
 		if r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
 			r.refs++
-			c.downloadSendersMu.Unlock()
+			r.lastUsed = time.Now()
+			c.downloadSenders.Unlock()
 			return r, nil
 		}
 		// dead entry: drop it. Do NOT terminate here — in-flight holders may
 		// still reference this sender; the last holder terminates it on release.
-		delete(c.downloadSenders, dc)
+		delete(c.downloadSenders.senders, dc)
 	}
-	c.downloadSendersMu.Unlock()
+	c.downloadSenders.Unlock()
 
 	conn, err := c.createExportedSender(ctx, dc, false, false)
 	if err != nil || conn == nil {
@@ -931,19 +1108,20 @@ func (c *Client) acquireDownloadSender(ctx context.Context, dc int) (*downloadSe
 	}
 	sender := NewExSender(conn)
 
-	c.downloadSendersMu.Lock()
-	if r, ok := c.downloadSenders[dc]; ok && r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
+	c.downloadSenders.Lock()
+	if r, ok := c.downloadSenders.senders[dc]; ok && r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
 		// someone else won the race — use theirs, drop our duplicate
 		r.refs++
-		c.downloadSendersMu.Unlock()
+		r.lastUsed = time.Now()
+		c.downloadSenders.Unlock()
 		if sender.MTProto != nil {
 			_ = sender.MTProto.Terminate()
 		}
 		return r, nil
 	}
-	ref := &downloadSenderRef{dc: dc, sender: sender, refs: 1}
-	c.downloadSenders[dc] = ref
-	c.downloadSendersMu.Unlock()
+	ref := &downloadSenderRef{dc: dc, sender: sender, refs: 1, lastUsed: time.Now()}
+	c.downloadSenders.senders[dc] = ref
+	c.downloadSenders.Unlock()
 	return ref, nil
 }
 
@@ -952,18 +1130,21 @@ func (c *Client) releaseDownloadSender(ref *downloadSenderRef) {
 		return
 	}
 	var dead *mtproto.MTProto
-	c.downloadSendersMu.Lock()
+	c.downloadSenders.Lock()
 	if ref.refs > 0 {
 		ref.refs--
 	}
-	if ref.refs == 0 && c.downloadSenders[ref.dc] != ref {
-		// last holder of a sender that has left the registry (dead/replaced):
-		// terminate it so its connection is released
-		if ref.sender != nil {
-			dead = ref.sender.MTProto
+	if ref.refs == 0 {
+		ref.lastUsed = time.Now()
+		if c.downloadSenders.senders[ref.dc] != ref {
+			// last holder of a sender that has left the registry (dead/replaced):
+			// terminate it so its connection is released
+			if ref.sender != nil {
+				dead = ref.sender.MTProto
+			}
 		}
 	}
-	c.downloadSendersMu.Unlock()
+	c.downloadSenders.Unlock()
 	if dead != nil {
 		_ = dead.Terminate()
 	}
