@@ -1011,7 +1011,7 @@ func (m *MTProto) handleRPCResult(ctx context.Context, data tl.Object, response 
 		// handle flood wait errors (code 420)
 		if strings.Contains(rpcError.Message, "FLOOD_WAIT_") || strings.Contains(rpcError.Message, "FLOOD_PREMIUM_WAIT_") {
 			if m.floodHandler(ctx, rpcError) {
-				ctx, cancel := context.WithTimeout(context.Background(), m.reqTimeout)
+				ctx, cancel := context.WithTimeout(ctx, m.reqTimeout)
 				defer cancel()
 				return m.makeRequestCtx(ctx, data, expectedTypes...)
 			}

@@ -77,6 +77,9 @@ type Client struct {
 	exportedKeys   map[int]*AuthExportedAuthorization
 	exportedKeysMu sync.Mutex
 	Log            Logger
+
+	downloadSendersMu sync.Mutex
+	downloadSenders   map[int]*downloadSenderRef
 }
 
 type DeviceConfig struct {
@@ -201,6 +204,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 
 	client.exSenders = NewExSenders()
+	client.downloadSenders = make(map[int]*downloadSenderRef)
 
 	return client, nil
 }
@@ -734,6 +738,10 @@ func (es *ExSenders) Close() {
 // When media is true, the sender targets the media-only DC for the given
 // DC ID when the server advertises one (falling back to the regular DC).
 func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams ...*AuthExportedAuthorization) (*mtproto.MTProto, error) {
+	return c.createExportedSender(context.Background(), dcID, cdn, media, authParams...)
+}
+
+func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, media bool, authParams ...*AuthExportedAuthorization) (*mtproto.MTProto, error) {
 	if dcID <= 0 {
 		return nil, errors.New("invalid data center ID")
 	}
@@ -781,6 +789,10 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 	}
 
 	for retry := 0; retry <= retryLimit; retry++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		initialReq := &InitConnectionParams{
 			ApiID:          c.clientData.appID,
 			DeviceModel:    c.clientData.deviceModel,
@@ -801,7 +813,7 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 				}
 			} else {
 				c.Log.Info("exporting auth (DC%d)", dcID)
-				auth, err = c.AuthExportAuthorization(int32(exported.GetDC()))
+				auth, err = c.exportAuthAuthorization(ctx, int32(exported.GetDC()))
 				if err != nil {
 					lastError = fmt.Errorf("exporting auth: %w", err)
 					c.Log.Error("failed to export authorization: %s", lastError.Error())
@@ -823,8 +835,8 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 		}
 
 		c.Log.Debug("initializing exported sender")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err = exported.MakeRequestCtx(ctx, &InvokeWithLayerParams{
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err = exported.MakeRequestCtx(reqCtx, &InvokeWithLayerParams{
 			Layer: ApiVersion,
 			Query: initialReq,
 		})
@@ -845,7 +857,13 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 				c.Log.Error("exported sender failed: %s", lastError.Error())
 			}
 
-			time.Sleep(200 * time.Millisecond)
+			timer := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 			continue
 		}
 
@@ -857,6 +875,91 @@ func (c *Client) CreateExportedSender(dcID int, cdn bool, media bool, authParams
 		lastError = errors.New("exported sender initialization failed after retries")
 	}
 	return nil, lastError
+}
+
+func (c *Client) exportAuthAuthorization(ctx context.Context, dcID int32) (*AuthExportedAuthorization, error) {
+	responseData, err := c.MTProto.MakeRequestCtx(ctx, &AuthExportAuthorizationParams{DcID: dcID})
+	if err != nil {
+		return nil, fmt.Errorf("sending AuthExportAuthorization: %w", err)
+	}
+
+	resp, ok := responseData.(*AuthExportedAuthorization)
+	if !ok {
+		return nil, fmt.Errorf("got invalid response type: %T", responseData)
+	}
+	return resp, nil
+}
+
+type downloadSenderRef struct {
+	dc     int
+	sender *ExSender
+	refs   int
+}
+
+// acquireDownloadSender returns the shared download sender for the given DC,
+// creating it (via cross-DC authorization) only when none is cached or the
+// cached one is dead. Multiple download pools share one connection per DC, so
+// cross-DC auth export/import happens at most once per DC per sender lifetime.
+func (c *Client) acquireDownloadSender(ctx context.Context, dc int) (*downloadSenderRef, error) {
+	if dc <= 0 {
+		dc = c.GetDC()
+	}
+
+	var toTerminate *mtproto.MTProto
+
+	c.downloadSendersMu.Lock()
+	if r, ok := c.downloadSenders[dc]; ok {
+		if r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
+			r.refs++
+			c.downloadSendersMu.Unlock()
+			return r, nil
+		}
+		// dead entry: drop it and rebuild below
+		if r.sender != nil {
+			toTerminate = r.sender.MTProto
+		}
+		delete(c.downloadSenders, dc)
+	}
+	c.downloadSendersMu.Unlock()
+
+	if toTerminate != nil {
+		_ = toTerminate.Terminate()
+	}
+
+	conn, err := c.createExportedSender(ctx, dc, false, false)
+	if err != nil || conn == nil {
+		if err == nil {
+			err = errors.New("nil exported sender")
+		}
+		return nil, fmt.Errorf("initialize download pool for DC%d: %w", dc, err)
+	}
+	sender := NewExSender(conn)
+
+	c.downloadSendersMu.Lock()
+	if r, ok := c.downloadSenders[dc]; ok && r.sender != nil && r.sender.MTProto != nil && r.sender.MTProto.IsTcpActive() {
+		// someone else won the race — use theirs, drop our duplicate
+		r.refs++
+		c.downloadSendersMu.Unlock()
+		if sender.MTProto != nil {
+			_ = sender.MTProto.Terminate()
+		}
+		return r, nil
+	}
+	ref := &downloadSenderRef{dc: dc, sender: sender, refs: 1}
+	c.downloadSenders[dc] = ref
+	c.downloadSendersMu.Unlock()
+	return ref, nil
+}
+
+func (c *Client) releaseDownloadSender(ref *downloadSenderRef) {
+	if ref == nil {
+		return
+	}
+	c.downloadSendersMu.Lock()
+	if ref.refs > 0 {
+		ref.refs--
+	}
+	c.downloadSendersMu.Unlock()
 }
 
 func (c *Client) GetExportedSendersStatus() map[int]int {

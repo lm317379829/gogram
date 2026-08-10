@@ -50,7 +50,9 @@ type WorkerPool struct {
 	sync.Mutex
 	workers []*ExSender
 	free    chan *ExSender
-	owns    bool // when true, Close() terminates the workers' connections (pool owns them)
+	owns    bool    // when true, Close() terminates the workers' connections (pool owns them)
+	release func()  // when set, Close() calls it once instead of terminating (shared senders)
+	closed  bool
 }
 
 func NewWorkerPool(size int) *WorkerPool {
@@ -142,7 +144,11 @@ func (wp *WorkerPool) FreeWorker(s *ExSender) {
 
 func (wp *WorkerPool) Close() {
 	wp.Lock()
-	defer wp.Unlock()
+	if wp.closed {
+		wp.Unlock()
+		return
+	}
+	wp.closed = true
 
 	// 池拥有连接时, 关闭即终止底层连接, 避免按请求建池后连接泄漏
 	var owned []*ExSender
@@ -159,6 +165,12 @@ func (wp *WorkerPool) Close() {
 			}
 		default:
 			wp.workers = nil
+			release := wp.release
+			wp.Unlock()
+			if release != nil {
+				release()
+				return
+			}
 			for _, s := range owned {
 				if s.MTProto != nil {
 					_ = s.Terminate()
@@ -2108,26 +2120,26 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	return buf, name, nil
 }
 
-// NewDownloadPool 为指定 DC 创建并初始化一个专属 WorkerPool。
+// NewDownloadPool 为指定 DC 返回一个 WorkerPool, 共享该 DC 的长连接。
 // dc=0 时自动使用客户端所在 DC。
-// 池内 worker 使用独立于主连接、不进入共享发送者缓存的专有连接：
-// 单个池连接断开/重建不会影响主客户端及其它下载池, 避免一处翻动殃及全局。
-// 调用方负责在不再需要时调用 pool.Close() 释放池及底层连接。
-func (c *Client) NewDownloadPool(dc int32) (*WorkerPool, error) {
+// 同一 DC 的多个池复用同一连接（首个池负责建连与跨 DC 授权, 之后直接复用），
+// 授权操作在每个 DC 的每个连接生命周期内至多执行一次, 避免高频跨 DC 授权触发 FloodWait。
+// 调用方负责在不再需要时调用 pool.Close() 释放引用。
+func (c *Client) NewDownloadPool(dc int32, ctx ...context.Context) (*WorkerPool, error) {
+	parent := context.Background()
+	if len(ctx) > 0 && ctx[0] != nil {
+		parent = ctx[0]
+	}
 	if dc == 0 {
 		dc = int32(c.GetDC())
 	}
 	pool := NewWorkerPool(1)
-	pool.owns = true
-	conn, err := c.CreateExportedSender(int(dc), false, false)
-	if err != nil || conn == nil {
-		pool.Close()
-		if err == nil {
-			err = errors.New("nil exported sender")
-		}
-		return nil, fmt.Errorf("initialize download pool for DC%d: %w", dc, err)
+	ref, err := c.acquireDownloadSender(parent, int(dc))
+	if err != nil {
+		return nil, err
 	}
-	pool.AddWorker(NewExSender(conn))
+	pool.release = func() { c.releaseDownloadSender(ref) }
+	pool.AddWorker(ref.sender)
 	return pool, nil
 }
 
