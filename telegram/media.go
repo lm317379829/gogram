@@ -50,6 +50,7 @@ type WorkerPool struct {
 	sync.Mutex
 	workers []*ExSender
 	free    chan *ExSender
+	owns    bool // when true, Close() terminates the workers' connections (pool owns them)
 }
 
 func NewWorkerPool(size int) *WorkerPool {
@@ -140,15 +141,24 @@ func (wp *WorkerPool) Close() {
 	wp.Lock()
 	defer wp.Unlock()
 
-	// Do not terminate workers here, as they are borrowed from the global ExSenders pool
-	// which manages their lifecycle and terminates them when idle.
+	// 池拥有连接时, 关闭即终止底层连接, 避免按请求建池后连接泄漏
+	var owned []*ExSender
+	if wp.owns {
+		owned = append(owned, wp.workers...)
+	}
 
 	// Drain the free channel
 	for {
 		select {
-		case <-wp.free:
+		case s := <-wp.free:
+			if wp.owns {
+				owned = append(owned, s)
+			}
 		default:
 			wp.workers = nil
+			for _, s := range owned {
+				_ = s.Terminate()
+			}
 			return
 		}
 	}
@@ -1611,6 +1621,12 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 		}
 	}
 	if err != nil {
+		// 调用方主动取消（HTTP 客户端断开/拖动进度条等）不是传输故障：
+		// 不得触发重拨或判定断连, 否则会打断同一连接上的其它并发请求
+		if reqCtx.Err() == context.Canceled {
+			return downloadResult{}, err
+		}
+
 		msg := err.Error()
 		
 		// 检查是否为断连错误：TCP 状态为非活跃，或者包含了典型的连接断开报错
@@ -1706,6 +1722,10 @@ func (j *downloadJob) fetchPartCDN(ctx context.Context, cdn *cdnRedirect, part d
 		Limit:     int32(part.limit),
 	})
 	if err != nil {
+		// 调用方主动取消不是传输故障, 直接返回, 不触发重拨
+		if reqCtx.Err() == context.Canceled {
+			return downloadResult{}, err
+		}
 		msg := err.Error()
 		switch {
 		case !sender.MTProto.IsTcpActive():
@@ -1877,11 +1897,6 @@ func initializeWorkers(numWorkers int, dc int32, c *Client, w *WorkerPool, ctx .
 func mediaSenderCacheKey(dc int) int { return dc + 10_000 }
 
 func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPool, media bool, ctx ...context.Context) error {
-	if numWorkers == 1 && dc == int32(c.GetDC()) && !media {
-		w.AddWorker(NewExSender(c.MTProto))
-		return nil
-	}
-
 	if media {
 		if addr, ok := c.DcList.GetMediaAddr(int(dc), false); ok {
 			c.Log.Debug(fmt.Sprintf("upload: using media DC%d at %s for %d workers", dc, addr, numWorkers))
@@ -2088,24 +2103,23 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	return buf, name, nil
 }
 
-// NewDownloadPool 为指定 DC 创建并初始化一个可复用的 WorkerPool。
+// NewDownloadPool 为指定 DC 创建并初始化一个专属 WorkerPool。
 // dc=0 时自动使用客户端所在 DC。
-// 调用方负责在不再需要时调用 pool.Close() 释放 pool 包装（不影响底层 TCP 连接）。
+// 池内 worker 使用独立于主连接、不进入共享发送者缓存的专有连接：
+// 单个池连接断开/重建不会影响主客户端及其它下载池, 避免一处翻动殃及全局。
+// 调用方负责在不再需要时调用 pool.Close() 释放池及底层连接。
 func (c *Client) NewDownloadPool(dc int32) (*WorkerPool, error) {
 	if dc == 0 {
 		dc = int32(c.GetDC())
 	}
 	pool := NewWorkerPool(1)
-	if err := initializeWorkers(1, dc, c, pool); err != nil {
+	pool.owns = true
+	conn, err := c.CreateExportedSender(int(dc), false, false)
+	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("initialize download pool for DC%d: %w", dc, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if !pool.WaitReady(ctx) {
-		pool.Close()
-		return nil, fmt.Errorf("timeout waiting for download pool worker (DC%d)", dc)
-	}
+	pool.AddWorker(NewExSender(conn))
 	return pool, nil
 }
 
