@@ -896,6 +896,12 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 		if err != nil {
 			if c.MatchRPCError(err, "AUTH_BYTES_INVALID") {
 				authParam.ID = 0
+				// 使被拒绝的授权缓存失效, 否则重试时 getExportedAuthorization 仍会复用同一份
+				// 无效授权, 导致循环耗尽重试次数并返回无意义的通用错误. 该场景常见于账号
+				// 重新登录/会话轮换后, 旧授权对目标 DC 已失效
+				c.exportedKeysMu.Lock()
+				delete(c.exportedKeys, int(exported.GetDC()))
+				c.exportedKeysMu.Unlock()
 				c.Log.Debug("AUTH_BYTES_INVALID: re-exporting authorization")
 				continue
 			}
