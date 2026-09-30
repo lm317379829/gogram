@@ -1632,7 +1632,16 @@ func (m *MTProto) processResponse(inContainer bool, msg messages.Common) error {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
 	if err := m.validateMessageTime(msg.GetMsgID(), data); err != nil {
-		return err
+		// 时间超窗多为服务器重放/过期的更新消息, 属可恢复情形。
+		// 跳过该条、压入去重集合并 ACK, 使服务器不再重复重发,
+		// 同时避免把它当作致命错误而触发整条连接的重连风暴。
+		if m.receivedIDs.remember(msg.GetMsgID()) {
+			m.Logger.Debug("skipping out-of-window message id=%d: %v", msg.GetMsgID(), err)
+			if msg.GetSeqNo()&1 != 0 {
+				_ = m.queueAck(msg.GetMsgID())
+			}
+		}
+		return nil
 	}
 	if msg.GetSeqNo()&1 != 0 {
 		if err := m.queueAck(msg.GetMsgID()); err != nil {
