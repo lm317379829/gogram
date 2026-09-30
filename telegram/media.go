@@ -25,10 +25,9 @@ import (
 
 	"errors"
 
+	mtproto "github.com/amarnathcjd/gogram"
 	"github.com/amarnathcjd/gogram/internal/encoding/tl"
 	"github.com/amarnathcjd/gogram/internal/utils"
-
-	mtproto "github.com/amarnathcjd/gogram"
 )
 
 const (
@@ -1179,14 +1178,16 @@ type downloadErrKind int
 const (
 	downloadErrRetry downloadErrKind = iota
 	downloadErrFlood
+	downloadErrMigrate
 	downloadErrContext
 	downloadErrFatal
 )
 
 type downloadFailure struct {
-	kind downloadErrKind
-	err  error
-	wait time.Duration
+	kind    downloadErrKind
+	err     error
+	wait    time.Duration
+	timeout bool
 }
 
 type downloadRange struct {
@@ -1309,9 +1310,10 @@ type downloadJob struct {
 	precise                bool
 	requestTimeoutOverride time.Duration
 
-	cdnMu    sync.Mutex
-	cdn      *cdnRedirect
-	cdnPools map[int32]*WorkerPool
+	cdnMu   sync.Mutex
+	cdn     *cdnRedirect
+	dcPools map[int32]*WorkerPool
+	fileDC  atomic.Int32
 
 	throttle *byteThrottle
 
@@ -1335,7 +1337,7 @@ func (c *Client) DownloadMedia(file any, Opts ...*DownloadOptions) (string, erro
 		return "", err
 	}
 	defer job.destination.Close()
-	defer job.closeCDNPools()
+	defer job.closeDCPools()
 	if job.progressTracker != nil {
 		defer job.progressTracker.stop()
 	}
@@ -1405,7 +1407,7 @@ func (c *Client) newDownloadJob(file any, opts *DownloadOptions) (*downloadJob, 
 		return nil, err
 	}
 
-	dc = getValue(dc, opts.DCId)
+	dc = getValue(opts.DCId, dc)
 	if dc == 0 {
 		dc = int32(c.GetDC())
 	}
@@ -1582,7 +1584,7 @@ func (j *downloadJob) runKnownSize() error {
 				if ctx.Err() != nil {
 					return
 				}
-				result, err := j.fetchPartLoop(ctx, pool, part)
+				result, err := j.fetchPartLoop(ctx, pool, part, nil)
 				if err != nil {
 					setErr(err)
 					return
@@ -1660,7 +1662,7 @@ func (j *downloadJob) runUnknownSize() error {
 			return nil
 		}
 		part := downloadRange{index: index, offset: offset, limit: j.partSize}
-		result, err := j.fetchPartLoop(j.ctx, pool, part)
+		result, err := j.fetchPartLoop(j.ctx, pool, part, nil)
 		if err != nil {
 			return err
 		}
@@ -1700,17 +1702,51 @@ func (j *downloadJob) runUnknownSize() error {
 	}
 }
 
-func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part downloadRange) (downloadResult, error) {
+func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part downloadRange, cdn *cdnRedirect) (downloadResult, error) {
 	const maxAttempts = 20
+	request := part
+	var assembled []byte
+	defer func() { tl.ReleaseLargeBuffer(assembled) }()
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		result, err := j.fetchPart(ctx, pool, part, attempt)
+	for attempt := 0; attempt < maxAttempts; {
+		if err := ctx.Err(); err != nil {
+			return downloadResult{}, err
+		}
+		var result downloadResult
+		var err error
+		if cdn != nil {
+			result, err = j.fetchCDNBlock(ctx, cdn, request, attempt)
+		} else {
+			result, err = j.fetchPart(ctx, pool, request, attempt)
+		}
 		if err == nil {
-			if err := j.throttle.wait(ctx, len(result.data)); err != nil {
+			if len(result.data) > request.limit {
 				tl.ReleaseLargeBuffer(result.data)
-				return downloadResult{}, err
+				return downloadResult{}, fmt.Errorf("%w: exceeds requested limit", errDownloadResponse)
 			}
-			return result, nil
+			if cdn == nil {
+				if err := j.throttle.wait(ctx, len(result.data)); err != nil {
+					tl.ReleaseLargeBuffer(result.data)
+					return downloadResult{}, err
+				}
+			}
+			if request.limit == part.limit && assembled == nil {
+				return result, nil
+			}
+			if assembled == nil {
+				assembled = make([]byte, 0, part.limit)
+			}
+			n := len(result.data)
+			assembled = append(assembled, result.data...)
+			tl.ReleaseLargeBuffer(result.data)
+			if n < request.limit || len(assembled) == part.limit {
+				result = downloadResult{part: part, data: assembled}
+				assembled = nil
+				return result, nil
+			}
+			request.offset += int64(n)
+			attempt = 0
+			continue
 		}
 		lastErr = err
 		// TCP-dead is a special fatal condition — propagate immediately, no retry.
@@ -1721,11 +1757,18 @@ func (j *downloadJob) fetchPartLoop(ctx context.Context, pool *WorkerPool, part 
 		if failure.kind == downloadErrFatal || failure.kind == downloadErrContext {
 			return downloadResult{}, failure.err
 		}
-		if err := j.sleepRetry(ctx, failure, attempt); err != nil {
+		attempt++
+		if attempt == maxAttempts {
+			break
+		}
+		if failure.timeout && request.limit > 4096 {
+			request.limit /= 2
+		}
+		if err := j.sleepRetry(ctx, failure, attempt-1); err != nil {
 			return downloadResult{}, err
 		}
 	}
-	return downloadResult{}, fmt.Errorf("part %d failed after %d attempts: %w", part.index, maxAttempts, lastErr)
+	return downloadResult{}, fmt.Errorf("part %d failed after %d attempts (%w): %w", part.index, maxAttempts, errDownloadAttempts, lastErr)
 }
 
 func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part downloadRange, attempt int) (downloadResult, error) {
@@ -1734,6 +1777,14 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 	j.cdnMu.Unlock()
 	if cdn != nil {
 		return j.fetchPartCDN(ctx, cdn, part, attempt)
+	}
+	fileDC := j.fileDC.Load()
+	if fileDC != 0 {
+		var err error
+		pool, err = j.downloadPool(ctx, fileDC, false)
+		if err != nil {
+			return downloadResult{}, err
+		}
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, j.requestTimeout(part.limit, attempt))
@@ -1767,6 +1818,9 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 	response, err := sender.MakeRequest(reqCtx, request)
 	if j.opts.Delay > 0 {
 		if sleepErr := sleepContext(ctx, time.Duration(j.opts.Delay)*time.Millisecond); sleepErr != nil && err == nil {
+			if file, ok := response.(*UploadFileObj); ok {
+				tl.ReleaseLargeBuffer(file.Bytes)
+			}
 			err = sleepErr
 		}
 	}
@@ -1777,8 +1831,16 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 			return downloadResult{}, err
 		}
 
+		// FILE_MIGRATE_X: 记录文件所在 DC, 后续分片直接走该 DC 拉取, 避免反复收到迁移错误
+		var rpc *mtproto.ErrResponseCode
+		if errors.As(err, &rpc) && rpc.Code == 303 && rpc.Message == "FILE_MIGRATE_X" {
+			if dc, ok := rpc.AdditionalInfo.(int); ok && dc > 0 && dc <= 5 {
+				j.fileDC.CompareAndSwap(fileDC, int32(dc))
+			}
+		}
+
 		msg := err.Error()
-		
+
 		// 检查是否为断连错误：TCP 状态为非活跃，或者包含了典型的连接断开报错
 		isDisconnected := !sender.MTProto.IsTcpActive() ||
 			strings.Contains(msg, "connection reset") ||
@@ -1810,9 +1872,9 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 		j.cdnMu.Unlock()
 		return j.fetchPartCDN(ctx, active, part, attempt)
 	case nil:
-		return downloadResult{}, errors.New("empty download response")
+		return downloadResult{}, fmt.Errorf("%w: empty download response", errDownloadResponse)
 	default:
-		return downloadResult{}, fmt.Errorf("unexpected download response %T", response)
+		return downloadResult{}, fmt.Errorf("%w: %T", errDownloadResponse, response)
 	}
 }
 
@@ -1841,28 +1903,48 @@ func (j *downloadJob) activateCDN(r *UploadFileCdnRedirect, origin *ExSender) er
 	return nil
 }
 
-func (j *downloadJob) cdnPool(ctx context.Context, dc int32) (*WorkerPool, error) {
-	j.cdnMu.Lock()
-	defer j.cdnMu.Unlock()
-	if j.cdnPools == nil {
-		j.cdnPools = make(map[int32]*WorkerPool)
+func (j *downloadJob) downloadPool(ctx context.Context, dc int32, cdn bool) (*WorkerPool, error) {
+	key := dc
+	if cdn {
+		key = -dc
 	}
-	if pool, ok := j.cdnPools[dc]; ok {
+	j.cdnMu.Lock()
+	pool := j.dcPools[key]
+	j.cdnMu.Unlock()
+	if pool != nil {
 		return pool, nil
 	}
-	conn, err := j.client.createExportedSender(ctx, int(dc), true, false)
-	if err != nil {
-		return nil, fmt.Errorf("creating cdn sender: %w", err)
+	if cdn {
+		conn, err := j.client.createExportedSender(ctx, int(dc), true, false)
+		if err != nil {
+			return nil, fmt.Errorf("creating cdn sender: %w", err)
+		}
+		pool = NewWorkerPool(1)
+		pool.owned = true
+		pool.AddWorker(NewExSender(conn))
+	} else {
+		pool = NewWorkerPool(max(1, j.workers))
+		if err := initializeWorkers(max(1, j.workers), dc, j.client, pool, ctx); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("creating download senders for DC%d: %w", dc, err)
+		}
 	}
-	pool := NewWorkerPool(1)
-	pool.owned = true
-	pool.AddWorker(NewExSender(conn))
-	j.cdnPools[dc] = pool
+	j.cdnMu.Lock()
+	if existing := j.dcPools[key]; existing != nil {
+		j.cdnMu.Unlock()
+		pool.Close()
+		return existing, nil
+	}
+	if j.dcPools == nil {
+		j.dcPools = make(map[int32]*WorkerPool)
+	}
+	j.dcPools[key] = pool
+	j.cdnMu.Unlock()
 	return pool, nil
 }
 
 func (j *downloadJob) fetchCDNBlock(ctx context.Context, cdn *cdnRedirect, part downloadRange, attempt int) (downloadResult, error) {
-	pool, err := j.cdnPool(ctx, cdn.dcID)
+	pool, err := j.downloadPool(ctx, cdn.dcID, true)
 	if err != nil {
 		return downloadResult{}, err
 	}
@@ -1914,9 +1996,9 @@ func (j *downloadJob) fetchCDNBlock(ctx context.Context, cdn *cdnRedirect, part 
 		}
 		return downloadResult{}, errors.New("cdn reupload requested")
 	case nil:
-		return downloadResult{}, errors.New("empty cdn response")
+		return downloadResult{}, fmt.Errorf("%w: empty cdn response", errDownloadResponse)
 	default:
-		return downloadResult{}, fmt.Errorf("unexpected cdn response %T", response)
+		return downloadResult{}, fmt.Errorf("%w: %T", errDownloadResponse, response)
 	}
 }
 
@@ -1929,10 +2011,10 @@ func (j *downloadJob) reuploadCDN(ctx context.Context, cdn *cdnRedirect, request
 	return err
 }
 
-func (j *downloadJob) closeCDNPools() {
+func (j *downloadJob) closeDCPools() {
 	j.cdnMu.Lock()
-	pools := j.cdnPools
-	j.cdnPools = nil
+	pools := j.dcPools
+	j.dcPools = nil
 	j.cdnMu.Unlock()
 	for _, p := range pools {
 		p.Close()
@@ -1978,16 +2060,28 @@ func (j *downloadJob) classifyError(ctx context.Context, err error) downloadFail
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return downloadFailure{kind: downloadErrContext, err: ctxErr}
 	}
-	if errors.Is(err, errCDNIntegrity) {
+	if errors.Is(err, errCDNIntegrity) || errors.Is(err, errDownloadResponse) || errors.Is(err, errDownloadAttempts) {
 		return downloadFailure{kind: downloadErrFatal, err: err}
 	}
-	msg := err.Error()
+	msg := strings.ToUpper(err.Error())
 	if MatchError(err, "FLOOD_WAIT_") || MatchError(err, "FLOOD_PREMIUM_WAIT_") {
 		wait := time.Duration(GetFloodWait(err)) * time.Second
 		if wait <= 0 {
 			wait = downloadRetryDelay(1)
 		}
 		return downloadFailure{kind: downloadErrFlood, err: err, wait: wait}
+	}
+	var rpc *mtproto.ErrResponseCode
+	if errors.As(err, &rpc) {
+		if rpc.Code == 303 && rpc.Message == "FILE_MIGRATE_X" {
+			if dc, ok := rpc.AdditionalInfo.(int); ok && dc > 0 && dc <= 5 {
+				return downloadFailure{kind: downloadErrMigrate, err: err}
+			}
+		}
+		if rpc.Code >= 500 && rpc.Code < 600 || rpc.Code <= -500 && rpc.Code > -600 {
+			return downloadFailure{kind: downloadErrRetry, err: err, timeout: strings.Contains(strings.ToUpper(rpc.Message), "TIMEOUT") || strings.EqualFold(rpc.Message, "Timedout")}
+		}
+		return downloadFailure{kind: downloadErrFatal, err: err}
 	}
 	fatal := []string{
 		"FILE_REFERENCE_EXPIRED",
@@ -2004,10 +2098,13 @@ func (j *downloadJob) classifyError(ctx context.Context, err error) downloadFail
 			return downloadFailure{kind: downloadErrFatal, err: err}
 		}
 	}
-	return downloadFailure{kind: downloadErrRetry, err: err}
+	return downloadFailure{kind: downloadErrRetry, err: err, timeout: errors.Is(err, context.DeadlineExceeded)}
 }
 
 func (j *downloadJob) sleepRetry(ctx context.Context, failure downloadFailure, attempt int) error {
+	if failure.kind == downloadErrMigrate {
+		return ctx.Err()
+	}
 	wait := failure.wait
 	if wait <= 0 {
 		wait = downloadRetryDelay(attempt)
@@ -2207,7 +2304,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 		requestTimeoutOverride: requestTimeout,
 	}
 	defer job.log.Flush()
-	defer job.closeCDNPools()
+	defer job.closeDCPools()
 
 	var pool *WorkerPool
 	if externalPool != nil {
@@ -2227,7 +2324,7 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int, opt
 	var buf []byte
 	for index, offset := 0, int64(start/chunkSize*chunkSize); offset < int64(end); index++ {
 		limit := chunkSize
-		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: offset, limit: limit})
+		result, err := job.fetchPartLoop(job.ctx, pool, downloadRange{index: index, offset: offset, limit: limit}, nil)
 		if err != nil {
 			return nil, "", err
 		}
@@ -2902,7 +2999,11 @@ func (s *resumeState) startFlusher(stop <-chan struct{}, interval time.Duration,
 	return done
 }
 
-var errCDNIntegrity = errors.New("CDN integrity verification failed")
+var (
+	errCDNIntegrity     = errors.New("CDN integrity verification failed")
+	errDownloadResponse = errors.New("unexpected download response")
+	errDownloadAttempts = errors.New("download retries exhausted")
+)
 
 func copyCDNHashes(hashes []*FileHash) ([]*FileHash, error) {
 	if len(hashes) > 8192 {
@@ -2972,7 +3073,7 @@ func (j *downloadJob) fetchPartCDN(ctx context.Context, cdn *cdnRedirect, part d
 		if h.Offset%int64(limit) != 0 {
 			return downloadResult{}, fmt.Errorf("%w: unaligned hash range", errCDNIntegrity)
 		}
-		result, err := j.fetchCDNBlock(ctx, cdn, downloadRange{index: part.index, offset: h.Offset, limit: limit}, attempt)
+		result, err := j.fetchPartLoop(ctx, nil, downloadRange{index: part.index, offset: h.Offset, limit: limit}, cdn)
 		if err != nil {
 			return downloadResult{}, err
 		}
