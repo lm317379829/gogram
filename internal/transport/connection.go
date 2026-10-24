@@ -139,6 +139,12 @@ func newMTProxyTCP(cfg TCPConnConfig) (Conn, bool, error) {
 	if dcID == 0 {
 		dcID = 2
 	}
+	if cfg.TestMode {
+		dcID += 10000
+	}
+	if cfg.MediaDC {
+		dcID = -dcID
+	}
 
 	conn, err := DialMTProxy(cfg.Ctx, cfg.Socks, cfg.Host, dcID, cfg.ModeVariant, cfg.LocalAddr, cfg.Logger)
 	if err != nil {

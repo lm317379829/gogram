@@ -105,6 +105,10 @@ type MTProto struct {
 	transportMu    sync.Mutex
 	writeMu        contextMutex
 
+	reconnectMu     sync.Mutex
+	reconnectCancel context.CancelFunc
+	lastRecv        atomic.Int64
+
 	authKey []byte
 	authMu  sync.RWMutex
 
@@ -526,7 +530,8 @@ func (m *MTProto) SwitchDc(ctx context.Context, dc int) error {
 	m.Logger.Debug("migrating to DC%d", dc)
 
 	m.connState.InProgress.Store(true)
-	defer m.connState.InProgress.Store(false)
+	connected := false
+	defer func() { m.finishReconnect(connected) }()
 
 	if err := m.Disconnect(); err != nil {
 		return err
@@ -575,7 +580,7 @@ func (m *MTProto) SwitchDc(ctx context.Context, dc int) error {
 	if errConn != nil {
 		return fmt.Errorf("creating connection: %w", errConn)
 	}
-
+	connected = true
 	return nil
 }
 
@@ -834,13 +839,13 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 	m.routineswg.Add(1)
 	go m.serviceWriter(ctx)
 
-	if !m.exported && !m.cdn {
+	if !m.cdn {
 		m.routineswg.Add(1)
 		go m.longPing(ctx)
-		if m.isHTTPTransport() {
-			m.routineswg.Add(1)
-			go m.httpWaiter(ctx)
-		}
+	}
+	if !m.exported && !m.cdn && m.isHTTPTransport() {
+		m.routineswg.Add(1)
+		go m.httpWaiter(ctx)
 	}
 
 	if !m.encrypted.Load() {
@@ -856,8 +861,8 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 		m.startPFSManager(ctx)
 	}
 
-	if err := parent.Err(); err != nil {
-		return err
+	if !stopParent() {
+		return parent.Err()
 	}
 	committed = true
 	return nil
@@ -899,6 +904,8 @@ func (m *MTProto) connect(ctx context.Context) error {
 			CommonConfig: cfg,
 			IpV6:         m.IpV6,
 			Obfuscated:   m.obfuscated,
+			TestMode:     m.testMode,
+			MediaDC:      m.mediaDC && !m.cdn,
 		}, m.mode)
 	}
 
@@ -1099,7 +1106,8 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 		var response tl.Object
 		select {
 		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			silent := time.Since(start) >= time.Second && m.lastRecv.Load() < start.UnixNano()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) && silent {
 				count := m.connState.ConsecutiveTimeouts.Add(1)
 				if count == 1 {
 					m.connState.ConsecutiveTimeoutStart.Store(time.Now().Unix())
@@ -1112,7 +1120,7 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 						m.requestReconnect()
 					}
 				}
-			} else {
+			} else if !silent {
 				m.connState.ConsecutiveTimeouts.Store(0)
 			}
 			m.Logger.Debug("request timeout: %T (msgID=%d, attempt=%d, elapsed=%s): %v", data, msgID, attempt+1, time.Since(start), ctx.Err())
@@ -1215,6 +1223,7 @@ func (m *MTProto) stopRoutines() {
 
 func (m *MTProto) Disconnect() error {
 	m.disconnected.Store(true)
+	m.cancelAutoReconnect()
 	m.tcpState.close()
 	m.stopRoutines()
 
@@ -1234,6 +1243,7 @@ func (m *MTProto) Disconnect() error {
 func (m *MTProto) Terminate() error {
 	m.terminated.Store(true)
 	m.disconnected.Store(true)
+	m.cancelAutoReconnect()
 	m.tcpState.close()
 	m.stopRoutines()
 
@@ -1295,16 +1305,45 @@ func (m *MTProto) requestReconnect() {
 		return
 	}
 	m.tcpState.SetActive(false)
-	go func() {
-		ctx := context.Background()
-		err := m.CreateConnection(ctx, false, false)
-		m.finishReconnect(err == nil)
-		if err != nil {
-			m.Logger.WithError(err).Trace("auto-reconnect aborted")
+	ctx, cancel := context.WithCancel(context.Background())
+	m.reconnectMu.Lock()
+	m.reconnectCancel = cancel
+	m.reconnectMu.Unlock()
+	go m.autoReconnect(ctx)
+}
+
+func (m *MTProto) cancelAutoReconnect() {
+	m.reconnectMu.Lock()
+	if m.reconnectCancel != nil {
+		m.reconnectCancel()
+		m.reconnectCancel = nil
+	}
+	m.reconnectMu.Unlock()
+}
+
+func (m *MTProto) autoReconnect(ctx context.Context) {
+	for attempt := 0; ; attempt++ {
+		if m.terminated.Load() || m.disconnected.Load() || ctx.Err() != nil {
+			m.finishReconnect(false)
 			return
 		}
-		m.Ping(ctx)
-	}()
+		err := m.CreateConnection(ctx, false, false)
+		if err == nil {
+			m.finishReconnect(true)
+			m.Ping(context.Background())
+			return
+		}
+		delay := reconnectDelay(m.connConfig.BaseDelay, min(m.connConfig.MaxDelay, time.Minute), attempt)
+		if attempt == 0 {
+			m.Logger.WithError(err).Warn("auto-reconnect failed; retrying in %s", delay)
+		} else {
+			m.Logger.WithError(err).Debug("auto-reconnect attempt %d failed; retrying in %s", attempt+1, delay)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(delay):
+		}
+	}
 }
 
 func (m *MTProto) finishReconnect(connected bool) {
@@ -1320,7 +1359,7 @@ func (m *MTProto) finishReconnect(connected bool) {
 func (m *MTProto) longPing(ctx context.Context) {
 	defer m.routineswg.Done()
 
-	ticker := time.NewTicker(defaultPingInterval)
+	ticker := time.NewTicker(m.pingInterval())
 	defer ticker.Stop()
 
 	for {
@@ -1334,6 +1373,13 @@ func (m *MTProto) longPing(ctx context.Context) {
 			m.Ping(ctx)
 		}
 	}
+}
+
+func (m *MTProto) pingInterval() time.Duration {
+	if half := m.connConfig.Timeout / 2; half > 0 && half < defaultPingInterval {
+		return half
+	}
+	return defaultPingInterval
 }
 
 func (m *MTProto) isHTTPTransport() bool {
@@ -1580,6 +1626,7 @@ func (m *MTProto) readMsg(ctx context.Context) error {
 		}
 		return &transportReadError{transport: t, cause: err}
 	}
+	m.lastRecv.Store(time.Now().UnixNano())
 	if encrypted, ok := response.(*messages.Encrypted); ok && encrypted.SessionID != m.GetSessionID() {
 		return errors.New("incoming message belongs to a different session")
 	}
@@ -1631,12 +1678,15 @@ func (m *MTProto) processResponse(inContainer bool, msg messages.Common) error {
 	if err != nil {
 		return fmt.Errorf("unmarshaling response: %w", err)
 	}
-	if err := m.validateMessageTime(msg.GetMsgID(), data); err != nil {
-		return err
-	}
 	if msg.GetSeqNo()&1 != 0 {
 		if err := m.queueAck(msg.GetMsgID()); err != nil {
 			return err
+		}
+	}
+	if !inContainer {
+		if err := m.validateMessageTime(msg.GetMsgID(), data); err != nil {
+			m.Logger.Debug("ignoring message %d: %v", msg.GetMsgID(), err)
+			return nil
 		}
 	}
 	if m.pendingAcks.Len() >= defaultPendingAcksThreshold {
@@ -1669,6 +1719,11 @@ messageTypeSwitching:
 			}
 			err := m.processResponse(true, v)
 			if err != nil {
+				var unknown *tl.ErrRegisteredObjectNotFound
+				if errors.As(err, &unknown) {
+					m.Logger.Warn(FormatDecodeError(err))
+					continue
+				}
 				return fmt.Errorf("processing item in container: %w", err)
 			}
 		}

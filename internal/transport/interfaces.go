@@ -35,6 +35,8 @@ type TCPConnConfig struct {
 	CommonConfig
 	IpV6       bool
 	Obfuscated bool
+	TestMode   bool
+	MediaDC    bool
 }
 
 type WSConnConfig struct {

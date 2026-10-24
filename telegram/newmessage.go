@@ -897,10 +897,17 @@ func (m *NewMessage) GetDiscussionMessages() ([]*NewMessage, error) {
 func (m *NewMessage) Link() string {
 	channelID := m.ChannelID()
 
+	if m == nil || m.Message == nil {
+		return ""
+	}
+	if _, basic := m.Message.PeerID.(*PeerChat); basic {
+		return ""
+	}
+
 	// Check if the chat is a channel or group with username
 	if m.IsChannel() || m.IsGroup() {
 		chat, err := m.GetChannel()
-		if err != nil && chat != nil && chat.Username != "" {
+		if err == nil && chat != nil && chat.Username != "" {
 			// For public channels/groups, we can use the username
 			return fmt.Sprintf("https://t.me/%s/%d", chat.Username, m.ID)
 		}

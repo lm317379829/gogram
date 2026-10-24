@@ -79,17 +79,11 @@ func (m *MTProto) sendPacket(ctx context.Context, request tl.Object, msgID int64
 		seqNo = m.UpdateSeqNo()
 	}
 
-	// A partially written frame cannot be resumed by another request. Closing
-	// this transport is necessary when cancellation interrupts the write.
-	interrupted := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = tr.Close(); close(interrupted) })
 	errorSendPacket := tr.WriteMsg(data, seqNo)
-	if !stop() {
-		<-interrupted
+	if utils.IsTransportError(errorSendPacket) {
+		m.reconnectTransport(tr)
+	} else if errorSendPacket == nil && ctx.Err() != nil {
 		errorSendPacket = ctx.Err()
-		m.reconnectTransport(tr)
-	} else if utils.IsTransportError(errorSendPacket) {
-		m.reconnectTransport(tr)
 	}
 
 	if errorSendPacket != nil {

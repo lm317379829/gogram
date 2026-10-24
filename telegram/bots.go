@@ -395,7 +395,10 @@ func (c *Client) nzStickerShortName(shortName string) (string, error) {
 	if !c.clientData.botAcc {
 		return shortName, nil
 	}
-	me := c.Me()
+	me, err := c.self()
+	if err != nil {
+		return "", fmt.Errorf("getting bot for sticker pack suffix: %w", err)
+	}
 	if me == nil || me.Username == "" {
 		return "", errors.New("bot has no username; cannot derive sticker pack suffix")
 	}

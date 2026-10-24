@@ -129,7 +129,7 @@ func (c *Client) loginBotInternal(botToken string, depth int) error {
 		return nil
 	}
 
-	_, err := c.AuthImportBotAuthorization(1, c.AppID(), c.AppHash(), botToken)
+	auth, err := c.AuthImportBotAuthorization(1, c.AppID(), c.AppHash(), botToken)
 	if err != nil {
 		if MatchError(err, "DC_MIGRATE") {
 			return c.loginBotInternal(botToken, depth+1)
@@ -137,10 +137,22 @@ func (c *Client) loginBotInternal(botToken string, depth int) error {
 		return fmt.Errorf("importing bot authorization: %w", err)
 	}
 
-	if is, err := c.IsAuthorized(); err != nil || !is {
+	if result, ok := auth.(*AuthAuthorizationObj); ok && result != nil {
+		if user, ok := result.User.(*UserObj); ok && user != nil && user.ID != 0 {
+			c.setMe(user)
+			if c.Cache != nil {
+				if err := c.Cache.BindToUser(user.ID); err != nil {
+					c.Log.WithError(err).Warn("failed to bind cache to user")
+				}
+			}
+		}
+	}
+
+	if _, err := c.IsAuthorized(); err != nil {
 		if MatchError(err, "DC_MIGRATE") {
 			return c.loginBotInternal(botToken, depth+1)
 		}
+		c.Log.WithError(err).Debug("initial update state unavailable")
 	}
 
 	c.clientData.botAcc = true

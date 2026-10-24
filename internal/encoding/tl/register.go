@@ -4,6 +4,7 @@ package tl
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 )
@@ -19,6 +20,14 @@ func lookupObjectType(crc uint32) (reflect.Type, bool) {
 	t, ok := objectByCrc[crc]
 	registryMu.RUnlock()
 	return t, ok
+}
+
+func RegisteredTypes() map[uint32]reflect.Type {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	out := make(map[uint32]reflect.Type, len(objectByCrc))
+	maps.Copy(out, objectByCrc)
+	return out
 }
 
 func isEnumCRC(crc uint32) bool {

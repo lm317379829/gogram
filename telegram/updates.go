@@ -4,7 +4,6 @@ package telegram
 
 import (
 	"cmp"
-	"container/list"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -397,68 +396,71 @@ func (cb *CallbackHandleBuilder) Handle() Handle {
 
 type lruCache struct {
 	sync.Mutex
-	maxSize   int
-	evictions int
-	items     map[updateDedupeKey]*list.Element
-	list      *list.List
+	maxSize        int
+	evictions      int
+	items          map[updateDedupeKey]*lruEntry
+	newest, oldest *lruEntry
 }
 
 type lruEntry struct {
-	key updateDedupeKey
+	key          updateDedupeKey
+	newer, older *lruEntry
 }
 
 func newLRUCache(maxSize int) *lruCache {
-	return &lruCache{
-		maxSize: maxSize,
-		items:   make(map[updateDedupeKey]*list.Element),
-		list:    list.New(),
+	return &lruCache{maxSize: maxSize, items: make(map[updateDedupeKey]*lruEntry)}
+}
+
+func (c *lruCache) touch(entry *lruEntry) {
+	if c.newest == entry {
+		return
+	}
+	if entry.newer != nil {
+		entry.newer.older = entry.older
+	}
+	if entry.older != nil {
+		entry.older.newer = entry.newer
+	}
+	if c.oldest == entry {
+		c.oldest = entry.newer
+	}
+	entry.newer, entry.older = nil, c.newest
+	if c.newest != nil {
+		c.newest.newer = entry
+	}
+	c.newest = entry
+	if c.oldest == nil {
+		c.oldest = entry
 	}
 }
 
 func (c *lruCache) TryAdd(key updateDedupeKey) bool {
 	c.Lock()
 	defer c.Unlock()
-
-	if elem, exists := c.items[key]; exists && elem != nil {
-		if _, ok := elem.Value.(*lruEntry); ok {
-			c.list.MoveToFront(elem)
-			return false
-		}
-		delete(c.items, key)
-		c.list.Remove(elem)
-	}
-
-	if c.maxSize > 0 && c.list.Len() >= c.maxSize {
-		oldest := c.list.Back()
-		entry := oldest.Value.(*lruEntry)
-		delete(c.items, entry.key)
-		entry.key = key
-		c.list.MoveToFront(oldest)
-		c.items[key] = oldest
-		c.evictions++
-		if c.evictions >= c.maxSize {
-			items := make(map[updateDedupeKey]*list.Element, c.maxSize)
-			for elem := c.list.Front(); elem != nil; elem = elem.Next() {
-				items[elem.Value.(*lruEntry).key] = elem
-			}
-			c.items = items
-			c.evictions = 0
-		}
+	if c.maxSize <= 0 {
 		return true
 	}
-
-	entry := &lruEntry{key: key}
-	elem := c.list.PushFront(entry)
-	c.items[key] = elem
-
-	if c.list.Len() > c.maxSize {
-		oldest := c.list.Back()
-		if oldest != nil {
-			if entry, ok := oldest.Value.(*lruEntry); ok && entry != nil {
-				delete(c.items, entry.key)
-			}
-			c.list.Remove(oldest)
+	if entry := c.items[key]; entry != nil {
+		c.touch(entry)
+		return false
+	}
+	var entry *lruEntry
+	if len(c.items) >= c.maxSize {
+		entry = c.oldest
+		delete(c.items, entry.key)
+		entry.key = key
+		c.evictions++
+	} else {
+		entry = &lruEntry{key: key}
+	}
+	c.touch(entry)
+	c.items[key] = entry
+	if c.evictions >= c.maxSize {
+		items := make(map[updateDedupeKey]*lruEntry, c.maxSize)
+		for entry := c.newest; entry != nil; entry = entry.older {
+			items[entry.key] = entry
 		}
+		c.items, c.evictions = items, 0
 	}
 	return true
 }
@@ -518,25 +520,25 @@ func newPatternCache() *patternCache {
 // It buffers out-of-order updates, detects gaps, and optionally triggers a fetch to fill them.
 type counterBox struct {
 	sync.Mutex
-	name        string
-	current     int32
-	pending     map[int32][]pendingCounter
-	recovering  bool
-	fetchGap    func(from, target int32)
-	logger      Logger
-	debounce    time.Duration
-	lastGapAt   time.Time
-	gapAttempt  uint64
-	gapFailures uint
-	onAdvance   func(int32)
-	schedule    func(func()) bool
+	name         string
+	current      int32
+	pending      map[int32][]pendingCounter
+	pendingCount int
+	recovering   bool
+	fetchGap     func(from, target int32)
+	logger       Logger
+	debounce     time.Duration
+	lastGapAt    time.Time
+	gapAttempt   uint64
+	gapFailures  uint
+	onAdvance    func(int32)
+	schedule     func(func()) bool
 }
 
 type pendingCounter struct {
 	counter int32
 	count   int32
 	apply   func()
-	arrived time.Time
 }
 
 func newCounterBox(name string, logger Logger, fetch func(from, target int32), onAdvance func(int32)) *counterBox {
@@ -610,22 +612,20 @@ func (b *counterBox) process(counter, count int32, recovered bool, apply func())
 			}
 		}
 	}
-	pendingCount := 0
-	for _, entries := range b.pending {
-		pendingCount += len(entries)
-	}
-	if pendingCount >= 1024 {
+	if b.pendingCount >= 1024 {
 		clear(b.pending)
+		b.pendingCount = 0
 		if b.logger != nil {
-			b.logger.Warn("counterBox=%s pending limit reached; recovering from pts=%d", b.name, b.current)
+			b.logger.Warn("counterBox=%s pending limit reached; recovering from %s=%d (target=%d)", b.name, b.name, b.current, counter)
 		}
 	}
-	item := pendingCounter{counter: counter, count: count, apply: apply, arrived: time.Now()}
+	item := pendingCounter{counter: counter, count: count, apply: apply}
 	if count > 0 {
 		b.pending[counter] = append([]pendingCounter{item}, b.pending[counter]...)
 	} else {
 		b.pending[counter] = append(b.pending[counter], item)
 	}
+	b.pendingCount++
 	b.triggerGapLocked(b.current, counter)
 	return false
 }
@@ -647,6 +647,7 @@ func (b *counterBox) forceSet(value int32) {
 	b.recordAdvance(value)
 	for k := range b.pending {
 		if k <= value {
+			b.pendingCount -= len(b.pending[k])
 			delete(b.pending, k)
 		}
 	}
@@ -661,6 +662,15 @@ func (b *counterBox) currentValue() int32 {
 	return b.current
 }
 
+func (b *counterBox) initialize(value int32) {
+	b.Lock()
+	defer b.Unlock()
+	if b.current == 0 && value > 0 {
+		b.current = value
+		b.recordAdvance(value)
+	}
+}
+
 func (b *counterBox) flushLocked() {
 	for {
 		var (
@@ -670,30 +680,19 @@ func (b *counterBox) flushLocked() {
 		)
 
 		for key, list := range b.pending {
+			for len(list) > 0 && max(list[0].counter-list[0].count, 0) < b.current {
+				list[0] = pendingCounter{}
+				list = list[1:]
+				b.pendingCount--
+			}
 			if len(list) == 0 {
 				delete(b.pending, key)
 				continue
 			}
-
+			b.pending[key] = list
 			candidate := list[0]
-			prev := candidate.counter - candidate.count
-			if prev < 0 {
-				prev = 0
-			}
-
-			if prev == b.current {
-				readyKey = key
-				readyItem = candidate
-				foundReady = true
-				break
-			}
-
-			if prev < b.current {
-				// Stale buffered item; drop it.
-				b.pending[key] = list[1:]
-				if len(b.pending[key]) == 0 {
-					delete(b.pending, key)
-				}
+			if max(candidate.counter-candidate.count, 0) == b.current && (!foundReady || key < readyKey) {
+				readyKey, readyItem, foundReady = key, candidate, true
 			}
 		}
 
@@ -703,7 +702,9 @@ func (b *counterBox) flushLocked() {
 
 		// Consume the ready item before releasing the lock.
 		if list := b.pending[readyKey]; len(list) > 0 {
+			list[0] = pendingCounter{}
 			list = list[1:]
+			b.pendingCount--
 			if len(list) == 0 {
 				delete(b.pending, readyKey)
 			} else {
@@ -3527,6 +3528,15 @@ func (c *Client) applyRecoveredUpdates(updates []Update, channelID int64) {
 }
 
 func (c *Client) FetchDifference(fromPts int32, limit int32) {
+	c.fetchDifference(fromPts, limit, func(ctx context.Context, req tl.Object) (any, error) {
+		return c.MTProto.MakeRequest(ctx, req)
+	})
+}
+
+func (c *Client) fetchDifference(fromPts int32, limit int32, request func(context.Context, tl.Object) (any, error)) {
+	if c.dispatcher == nil {
+		return
+	}
 	c.dispatcher.Lock()
 	if c.dispatcher.recoveringDifference {
 		c.dispatcher.Unlock()
@@ -3541,7 +3551,7 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 		c.dispatcher.Unlock()
 	}()
 
-	if limit == 0 {
+	if limit <= 0 {
 		limit = 5000
 	}
 	if limit > 10000 {
@@ -3565,6 +3575,27 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 	c.dispatcher.stopMu.Lock()
 	stop := c.dispatcher.stopChan
 	c.dispatcher.stopMu.Unlock()
+	select {
+	case <-stop:
+		return
+	default:
+	}
+	if req.Pts <= 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stateRaw, err := request(ctx, &UpdatesGetStateParams{})
+		cancel()
+		if err != nil {
+			c.Log.Warn("difference bootstrap failed (qts=%d): %v", req.Qts, err)
+			return
+		}
+		state, ok := stateRaw.(*UpdatesState)
+		if !ok || state == nil || state.Pts <= 0 {
+			c.Log.Warn("difference bootstrap returned no valid PTS (%T)", stateRaw)
+			return
+		}
+		c.dispatcher.globalPtsBox.initialize(state.Pts)
+		req.Pts = c.dispatcher.GetPts()
+	}
 	for {
 		select {
 		case <-stop:
@@ -3572,11 +3603,11 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 		default:
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		updates, err := c.MTProto.MakeRequest(ctx, req)
+		updates, err := request(ctx, req)
 		cancel()
 
 		if err != nil {
-			c.Log.Debug("difference request failed: %v", err)
+			c.Log.Warn("difference request failed (pts=%d, qts=%d, date=%d): %v", req.Pts, req.Qts, req.Date, err)
 			return
 		}
 
@@ -3584,6 +3615,13 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 		case *UpdatesDifferenceEmpty:
 			c.dispatcher.SetDate(u.Date)
 			c.dispatcher.SetSeq(u.Seq)
+			qts := c.dispatcher.globalQtsBox
+			qts.Lock()
+			current, pending := qts.current, qts.pendingCount
+			qts.Unlock()
+			if pending > 0 {
+				c.Log.Warn("difference empty with unresolved qts gap (qts=%d, pending=%d); retrying with backoff", current, pending)
+			}
 			return
 
 		case *UpdatesDifferenceObj:
@@ -3636,7 +3674,7 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 			c.dispatcher.SetDate(u.IntermediateState.Date)
 
 			if u.IntermediateState.Pts <= req.Pts && u.IntermediateState.Qts <= req.Qts && u.IntermediateState.Date <= req.Date {
-				c.Log.Debug("difference slice did not advance state (pts=%d, qts=%d)", req.Pts, req.Qts)
+				c.Log.Warn("difference slice did not advance state (pts=%d, qts=%d)", req.Pts, req.Qts)
 				return
 			}
 			req.Pts = u.IntermediateState.Pts
@@ -3647,9 +3685,16 @@ func (c *Client) FetchDifference(fromPts int32, limit int32) {
 			c.Log.Debug("difference too long, refetching state (pts=%d, limit=%d, fetched=%d)", u.Pts, limit, totalFetched)
 			c.dispatcher.SetPts(u.Pts)
 
-			state, err := c.UpdatesGetState()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			stateRaw, err := request(ctx, &UpdatesGetStateParams{})
+			cancel()
 			if err != nil {
 				c.Log.Error("failed to get update state: %v", err)
+				return
+			}
+			state, ok := stateRaw.(*UpdatesState)
+			if !ok || state == nil {
+				c.Log.Warn("invalid update state response: %T", stateRaw)
 				return
 			}
 

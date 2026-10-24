@@ -111,9 +111,6 @@ func (wp *WorkerPool) Next(ctx context.Context) *ExSender {
 		if next == nil || next.MTProto == nil {
 			return nil
 		}
-		if !next.MTProto.IsTcpActive() {
-			_ = next.Reconnect(ctx, false)
-		}
 
 		next.lastUsedMu.Lock()
 		next.lastUsed = time.Now()

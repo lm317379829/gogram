@@ -603,11 +603,14 @@ func (c *Client) editMessage(Peer InputPeer, id int32, Message string, entities 
 		return packMessage(c, processed), nil
 	}
 
-	return packMessage(c, &MessageObj{
+	message := &MessageObj{
 		ID:     id,
 		PeerID: c.getPeer(Peer),
-		FromID: &PeerUser{UserID: c.Me().ID},
-	}), nil
+	}
+	if me := c.getMe(); me != nil {
+		message.FromID = &PeerUser{UserID: me.ID}
+	}
+	return packMessage(c, message), nil
 }
 
 func (c *Client) editBotInlineMessage(ID InputBotInlineMessageID, Message string, entities []MessageEntity, Media any, options *SendOptions) (*NewMessage, error) {

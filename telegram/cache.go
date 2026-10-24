@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -641,6 +640,7 @@ func (c *CACHE) getUserPeer(userID int64) (InputUser, error) {
 }
 
 func (c *CACHE) getChannelPeer(channelID int64) (InputChannel, error) {
+	channelID = trimSuffixHundred(channelID)
 	c.Lock()
 	defer c.Unlock()
 
@@ -689,8 +689,10 @@ func (c *CACHE) LookupUsername(username string) (peerID int64, accessHash int64,
 }
 
 func (c *Client) GetInputPeer(peerID int64) (InputPeer, error) {
-	// channel id (negative with -100 prefix)
-	if strings.HasPrefix(strconv.FormatInt(peerID, 10), "-100") {
+	if peerID == 0 {
+		return nil, errors.New("invalid peer ID 0: use GetMe to retrieve self or pass 'me'")
+	}
+	if peerID < -1000000000000 {
 		channelID := trimSuffixHundred(peerID)
 		c.Cache.Lock()
 		if channelHash, ok := c.Cache.InputPeers.InputChannels[channelID]; ok {
@@ -822,6 +824,7 @@ func (c *Client) fetchUser(userID int64) (*UserObj, error) {
 }
 
 func (c *Client) getChannelFromCache(channelID int64) (*Channel, error) {
+	channelID = trimSuffixHundred(channelID)
 	value, err := c.fetchPeerOnce(cachePeerKey{'c', channelID}, func() (any, error) { return c.fetchChannel(channelID) })
 	if err != nil {
 		return nil, err
@@ -934,6 +937,7 @@ func (c *Client) GetUser(userID int64) (*UserObj, error) {
 	return user, nil
 }
 
+// GetChannel accepts the raw channel ID or its Bot API form (-100...).
 func (c *Client) GetChannel(channelID int64) (*Channel, error) {
 	channel, err := c.getChannelFromCache(channelID)
 	if err != nil {
@@ -942,7 +946,14 @@ func (c *Client) GetChannel(channelID int64) (*Channel, error) {
 	return channel, nil
 }
 
+// GetChat accepts the raw chat ID or its Bot API form (negative).
 func (c *Client) GetChat(chatID int64) (*ChatObj, error) {
+	if trimSuffixHundred(chatID) != chatID {
+		return nil, fmt.Errorf("%d is a channel ID, not a basic group: use GetChannel", chatID)
+	}
+	if chatID < 0 {
+		chatID = -chatID
+	}
 	chat, err := c.getChatFromCache(chatID)
 	if err != nil {
 		return nil, err
@@ -1220,7 +1231,7 @@ func (c *Client) IdInCache(id int64) bool {
 	if _, ok := c.Cache.InputPeers.InputUsers[id]; ok {
 		return true
 	}
-	if _, ok := c.Cache.InputPeers.InputChannels[id]; ok {
+	if _, ok := c.Cache.InputPeers.InputChannels[trimSuffixHundred(id)]; ok {
 		return true
 	}
 
@@ -1228,14 +1239,11 @@ func (c *Client) IdInCache(id int64) bool {
 }
 
 func trimSuffixHundred(id int64) int64 {
-	if id >= 0 {
-		return id
-	}
 	const channelOffset int64 = -1000000000000
 	if id < channelOffset {
 		return channelOffset - id
 	}
-	return -id
+	return id
 }
 
 // GetCachedMedia retrieves a cached media by its key (URL or file hash)
