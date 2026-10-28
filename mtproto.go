@@ -34,6 +34,7 @@ const (
 	defaultMaxReconnectAttempts = 2000
 	defaultBaseReconnectDelay   = 2 * time.Second
 	defaultPingInterval         = 30 * time.Second
+	defaultRequestRetryInterval = 5 * time.Second
 	defaultPendingAcksThreshold = 10
 	maxMsgsAckPerBatch          = 8192
 )
@@ -80,6 +81,26 @@ type ReconnectState struct {
 	ConsecutiveTimeouts     atomic.Int32
 	ConsecutiveTimeoutStart atomic.Int64
 	LastSuccessfulConnect   atomic.Int64
+	lastConnectAttempt      atomic.Int64
+}
+
+type reconnectOperation struct {
+	done chan struct{}
+	err  error
+}
+
+type tempAuthState struct {
+	key              []byte
+	keyHash          []byte
+	expiresAt        int64
+	serverSalt       int64
+	pendingKey       []byte
+	pendingKeyHash   []byte
+	pendingExpiresAt int64
+	pendingSalt      int64
+	previousKey      []byte
+	previousKeyHash  []byte
+	previousSalt     int64
 }
 
 type MTProto struct {
@@ -107,24 +128,13 @@ type MTProto struct {
 
 	reconnectMu     sync.Mutex
 	reconnectCancel context.CancelFunc
+	reconnectOp     *reconnectOperation
 	lastRecv        atomic.Int64
 
-	authKey []byte
-	authMu  sync.RWMutex
-
+	authMu      sync.RWMutex
+	authKey     []byte
 	authKeyHash []byte
-
-	tempAuthKey          []byte
-	tempAuthKeyHash      []byte
-	tempAuthExpiresAt    int64
-	pendingTempAuthKey   []byte
-	pendingTempKeyHash   []byte
-	pendingTempExpiresAt int64
-	tempServerSalt       int64
-	pendingTempSalt      int64
-	previousTempAuthKey  []byte
-	previousTempKeyHash  []byte
-	previousTempSalt     int64
+	tempAuth    tempAuthState
 
 	noRedirect bool
 
@@ -133,6 +143,7 @@ type MTProto struct {
 	sessionId  atomic.Int64
 
 	responseChannels *utils.SyncInt64ObjectChan
+	requestChanges   sync.Map
 	expectedTypes    *utils.SyncInt64ReflectTypes
 	pendingAcks      *utils.SyncSet[int64]
 	receivedIDs      receivedMessageWindow
@@ -180,9 +191,10 @@ type MTProto struct {
 
 	onMigration func()
 
-	messageTracker     *utils.SyncInt64Int64
-	messageTypesMap    sync.Map // msgID -> request type name
-	maxRequestAttempts int      // Maximum total attempts for one RPC
+	messageTracker       *utils.SyncInt64Int64
+	messageTypesMap      sync.Map // msgID -> request type name
+	maxRequestAttempts   int      // Maximum protocol/application attempts; outages are bounded by ctx.
+	requestRetryInterval time.Duration
 }
 
 type Config struct {
@@ -529,9 +541,23 @@ func (m *MTProto) SwitchDc(ctx context.Context, dc int) error {
 
 	m.Logger.Debug("migrating to DC%d", dc)
 
+	m.reconnectMu.Lock()
+	if m.reconnectCancel != nil {
+		m.reconnectCancel()
+		m.reconnectCancel = nil
+	}
+	op := &reconnectOperation{done: make(chan struct{})}
+	m.reconnectOp = op
 	m.connState.InProgress.Store(true)
+	m.reconnectMu.Unlock()
 	connected := false
-	defer func() { m.finishReconnect(connected) }()
+	defer func() {
+		if connected {
+			m.finishReconnect(op, nil)
+		} else {
+			m.finishReconnect(op, errors.New("DC migration failed"))
+		}
+	}()
 
 	if err := m.Disconnect(); err != nil {
 		return err
@@ -549,13 +575,7 @@ func (m *MTProto) SwitchDc(ctx context.Context, dc int) error {
 	m.encrypted.Store(false)
 	m.sessionId.Store(utils.GenerateSessionID())
 
-	m.tempAuthKey = nil
-	m.tempAuthKeyHash = nil
-	m.tempAuthExpiresAt = 0
-	m.pendingTempAuthKey = nil
-	m.pendingTempKeyHash = nil
-	m.previousTempAuthKey = nil
-	m.previousTempKeyHash = nil
+	m.tempAuth = tempAuthState{}
 	m.authMu.Unlock()
 	m.notifyPendingRequestsOfConfigChange()
 	m.expectedTypes.SwapAndClear()
@@ -698,21 +718,18 @@ func reconnectDelay(base, maximum time.Duration, attempt int) time.Duration {
 }
 
 func (m *MTProto) connectWithRetry(ctx context.Context) error {
-	err := m.connect(ctx)
-	if err == nil {
-		return nil
-	}
-
-	if m.connectionHandler != nil {
-		m.Logger.Debug("delegating reconnection to custom handler")
-		return m.connectionHandler(err)
-	}
-
-	for attempt := range m.connConfig.MaxAttempts {
-		err := m.connect(ctx)
+	var err error
+	for attempt := 0; attempt <= m.connConfig.MaxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if m.terminated.Load() || m.disconnected.Load() {
+			return errors.New("client is disconnected")
+		}
+		err = m.connect(ctx)
 		if err == nil {
 			if attempt > 0 {
-				m.Logger.Info("reconnected successfully after %d attempts", attempt+1)
+				m.Logger.Debug("transport established after %d attempts; waiting for server traffic", attempt+1)
 			}
 			return nil
 		}
@@ -720,26 +737,17 @@ func (m *MTProto) connectWithRetry(ctx context.Context) error {
 		if utils.IsFatalConnectionError(err) {
 			return err
 		}
-
-		if m.terminated.Load() {
-			return fmt.Errorf("mtproto terminated during reconnection")
-		}
-		if m.disconnected.Load() {
-			return fmt.Errorf("mtproto disconnected during reconnection")
-		}
-
-		delay := reconnectDelay(m.connConfig.BaseDelay, m.connConfig.MaxDelay, attempt)
-
-		m.Logger.Debug("reconnection failed (%d/%d): %v; retrying in %s", attempt+1, m.connConfig.MaxAttempts, err, delay)
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-time.After(delay):
-			continue
 		}
+		if m.connectionHandler != nil {
+			if handlerErr := m.connectionHandler(err); handlerErr != nil {
+				return handlerErr
+			}
+		}
+		m.Logger.Debug("connection attempt %d failed: %v", attempt+1, err)
 	}
-
-	return fmt.Errorf("max reconnection attempts (%d) reached", m.connConfig.MaxAttempts)
+	return fmt.Errorf("max reconnection attempts (%d) reached: %w", m.connConfig.MaxAttempts, err)
 }
 
 // CreateConnection limits connection setup, including authentication,
@@ -761,6 +769,7 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 	}
 	if allowDisconnected {
 		m.disconnected.Store(false)
+		m.tcpState.resetError()
 	} else if m.disconnected.Load() {
 		return fmt.Errorf("mtproto is disconnected")
 	}
@@ -811,7 +820,11 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 
 	err := m.connectWithRetry(ctx)
 	if err != nil {
-		m.Logger.WithError(err).Error("failed to create connection")
+		if utils.IsFatalConnectionError(err) {
+			m.Logger.WithError(err).Error("failed to create connection")
+		} else {
+			m.Logger.WithError(err).Debug("failed to create connection")
+		}
 		return err
 	}
 	m.tcpState.SetActive(true)
@@ -836,17 +849,6 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 	}
 
 	m.startReadingResponses(ctx)
-	m.routineswg.Add(1)
-	go m.serviceWriter(ctx)
-
-	if !m.cdn {
-		m.routineswg.Add(1)
-		go m.longPing(ctx)
-	}
-	if !m.exported && !m.cdn && m.isHTTPTransport() {
-		m.routineswg.Add(1)
-		go m.httpWaiter(ctx)
-	}
 
 	if !m.encrypted.Load() {
 		m.Logger.Debug("generating new auth key")
@@ -856,6 +858,16 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 		}
 		m.Logger.Debug("auth key generated")
 	}
+	m.routineswg.Add(1)
+	go m.serviceWriter(ctx)
+	if !m.cdn {
+		m.routineswg.Add(1)
+		go m.longPing(ctx)
+	}
+	if !m.exported && !m.cdn && m.isHTTPTransport() {
+		m.routineswg.Add(1)
+		go m.httpWaiter(ctx)
+	}
 
 	if m.enablePFS && !m.cdn {
 		m.startPFSManager(ctx)
@@ -864,11 +876,17 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 	if !stopParent() {
 		return parent.Err()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	committed = true
 	return nil
 }
 
 func (m *MTProto) connect(ctx context.Context) error {
+	if err := m.waitReconnectDelay(ctx); err != nil {
+		return err
+	}
 	dcId := m.GetDC()
 	m.Logger.Debug("init transport [%s] for DC%d", m.txType, dcId)
 
@@ -914,10 +932,7 @@ func (m *MTProto) connect(ctx context.Context) error {
 		return fmt.Errorf("creating transport: %w", err)
 	}
 
-	if err := m.checkRapidReconnect(); err != nil {
-		_ = newTransport.Close()
-		return err
-	}
+	m.connState.LastSuccessfulConnect.Store(time.Now().Unix())
 	m.transportMu.Lock()
 	m.transport = newTransport
 	m.transportMu.Unlock()
@@ -953,8 +968,8 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 			// require permanent auth key first.
 			m.authMu.RLock()
 			hasPermanent := len(m.authKey) > 0
-			expiresAt := m.tempAuthExpiresAt
-			hasTemp := len(m.tempAuthKey) > 0
+			expiresAt := m.tempAuth.expiresAt
+			hasTemp := len(m.tempAuth.key) > 0
 			m.authMu.RUnlock()
 			if !hasPermanent {
 				select {
@@ -971,7 +986,7 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 			if needNew {
 				m.Logger.Debug("generating new temporary auth key for PFS")
 				if err := m.createTempAuthKey(ctx, tempLifetime); err != nil {
-					m.Logger.WithError(err).Error("failed to create temporary auth key")
+					m.Logger.WithError(err).Debug("failed to create temporary auth key; retrying")
 					select {
 					case <-ctx.Done():
 						return
@@ -981,7 +996,7 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 				}
 
 				if err := m.bindTempAuthKey(ctx); err != nil {
-					m.Logger.WithError(err).Error("failed to bind temporary auth key")
+					m.Logger.WithError(err).Debug("failed to bind temporary auth key; retrying")
 					select {
 					case <-ctx.Done():
 						return
@@ -992,7 +1007,7 @@ func (m *MTProto) startPFSManager(ctx context.Context) {
 
 				// refresh local expiry after successful bind.
 				m.authMu.RLock()
-				expiresAt = m.tempAuthExpiresAt
+				expiresAt = m.tempAuth.expiresAt
 				m.authMu.RUnlock()
 			}
 
@@ -1029,6 +1044,11 @@ func (m *MTProto) MakeRequestOnce(ctx context.Context, data tl.Object, expectedT
 }
 
 func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts int, expectedTypes ...reflect.Type) (any, error) {
+	var handshakeRequest bool
+	switch data.(type) {
+	case *objects.ReqPQParams, *objects.ReqPQMultiParams, *objects.ReqDHParamsParams, *objects.SetClientDHParamsParams:
+		handshakeRequest = true
+	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline && m.reqTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, m.reqTimeout)
@@ -1037,19 +1057,44 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 
 	var pendingID int64
 	var lastErr error
+	var packet requestPacket
+	var retryTimer *time.Timer
+	var retry <-chan time.Time
+	retryInterval := m.requestRetryInterval
+	if retryInterval <= 0 {
+		retryInterval = defaultRequestRetryInterval
+	}
+	if !handshakeRequest && maxAttempts > 1 && !isNotContentRelated(data) {
+		retryTimer = time.NewTimer(retryInterval)
+		retryTimer.Stop()
+		retry = retryTimer.C
+		defer retryTimer.Stop()
+	}
+	cleanupEnvelope := func() {
+		if packet.envelopeID != 0 {
+			m.responseChannels.Delete(packet.envelopeID)
+			packet.envelopeID, packet.envelopeResponse = 0, nil
+		}
+	}
 	cleanup := func() {
+		cleanupEnvelope()
 		if pendingID != 0 {
+			m.requestChanges.Delete(pendingID)
 			m.responseChannels.Delete(pendingID)
 			m.expectedTypes.Delete(pendingID)
 			m.messageTracker.Delete(pendingID)
 			m.messageTypesMap.Delete(pendingID)
 			pendingID = 0
 		}
+		packet.response, packet.changed = nil, nil
 	}
 	defer cleanup()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		cleanup()
+	for attempt := 0; attempt < maxAttempts; {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+		cleanupEnvelope()
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1057,84 +1102,150 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 			return nil, errors.New("client is disconnected")
 		}
 
-		m.transportMu.Lock()
-		hasTransport := m.transport != nil
-		m.transportMu.Unlock()
-		if !hasTransport && !m.IsTcpActive() {
-			if err := m.CreateConnection(ctx, false, false); err != nil {
-				return nil, fmt.Errorf("establishing connection: %w", err)
-			}
-		}
-		if err := m.tcpState.WaitForActive(ctx); err != nil {
-			if ctx.Err() == nil && maxAttempts > 1 && m.errorHandler != nil && m.errorHandler(fmt.Errorf("tcp inactive: %w", err)) {
-				lastErr = err
-				continue
-			}
-			return nil, fmt.Errorf("tcp inactive: %w", err)
-		}
-
-		respChan, msgID, err := m.sendPacket(ctx, data, 0, expectedTypes...)
-		pendingID = msgID
-		if err != nil {
-			lastErr = err
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if utils.IsTransportError(err) {
-				if m.terminated.Load() || m.disconnected.Load() {
-					return nil, fmt.Errorf("transport closed: %w", err)
-				}
-				m.Logger.WithError(err).Trace("transport error for msgID=%d, reconnecting (attempt=%d/%d)", msgID, attempt+1, maxAttempts)
-				continue
-			}
-			if maxAttempts > 1 && m.errorHandler != nil && m.errorHandler(err) {
-				continue
-			}
-			return nil, err
-		}
-		if isNullableResponse(data) {
-			return tl.UnwrapNativeTypes(<-respChan), nil
-		}
-
-		start := time.Now()
-		if msgID != 0 {
-			m.messageTracker.Add(msgID, start.Unix())
-			m.messageTypesMap.Store(msgID, fmt.Sprintf("%T", data))
-			m.Logger.Trace("request sent: %T (msgID=%d, attempt=%d)", data, msgID, attempt+1)
-		}
-
 		var response tl.Object
-		select {
-		case <-ctx.Done():
-			silent := time.Since(start) >= time.Second && m.lastRecv.Load() < start.UnixNano()
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) && silent {
-				count := m.connState.ConsecutiveTimeouts.Add(1)
-				if count == 1 {
-					m.connState.ConsecutiveTimeoutStart.Store(time.Now().Unix())
+		var waitErr error
+		for response == nil && waitErr == nil {
+			m.tcpState.mu.RLock()
+			active, closed, changed := m.tcpState.active, m.tcpState.closed, m.tcpState.ch
+			waitErr = m.tcpState.err
+			m.tcpState.mu.RUnlock()
+			if closed || active {
+				break
+			}
+			m.requestReconnect()
+			select {
+			case <-ctx.Done():
+				waitErr = ctx.Err()
+			case <-changed:
+			case resp, ok := <-packet.response:
+				if !ok {
+					return nil, errors.New("response channel closed")
 				}
-				if count >= 5 {
-					duration := time.Now().Unix() - m.connState.ConsecutiveTimeoutStart.Load()
-					m.connState.ConsecutiveTimeouts.Store(0)
-					if duration < 60 {
-						m.Logger.Debug("5 consecutive timeouts in %ds; reconnecting", duration)
-						m.requestReconnect()
+				response = resp
+			}
+		}
+		if waitErr != nil {
+			if ctx.Err() == nil && maxAttempts > 1 && m.errorHandler != nil && m.errorHandler(fmt.Errorf("tcp inactive: %w", waitErr)) {
+				lastErr = waitErr
+				attempt++
+				continue
+			}
+			return nil, fmt.Errorf("tcp inactive: %w", waitErr)
+		}
+		start := time.Now()
+		msgID := pendingID
+		var envelopeResponse bool
+		if response == nil {
+			if !handshakeRequest && (!m.encrypted.Load() || m.serviceModeActivated.Load()) {
+				if err := m.lifecycleMu.Lock(ctx); err != nil {
+					return nil, err
+				}
+				ready := m.encrypted.Load() && !m.serviceModeActivated.Load()
+				m.lifecycleMu.Unlock()
+				if !ready {
+					m.requestReconnect()
+				}
+				continue
+			}
+
+			var respChan chan tl.Object
+			var err error
+			respChan, msgID, err = m.sendPacket(ctx, data, 0, &packet, expectedTypes...)
+			if msgID != 0 {
+				pendingID = msgID
+			}
+			if err != nil {
+				lastErr = err
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				if errors.Is(err, ErrSessionChanged) {
+					return nil, err
+				}
+				if utils.IsTransportError(err) {
+					if m.terminated.Load() || m.disconnected.Load() {
+						return nil, fmt.Errorf("transport closed: %w", err)
 					}
+					if maxAttempts == 1 {
+						return nil, err
+					}
+					m.Logger.WithError(err).Trace("transport error for msgID=%d, reconnecting (attempt=%d/%d)", msgID, attempt+1, maxAttempts)
+					continue
 				}
-			} else if !silent {
-				m.connState.ConsecutiveTimeouts.Store(0)
+				if maxAttempts > 1 && m.errorHandler != nil && m.errorHandler(err) {
+					attempt++
+					cleanup()
+					packet = requestPacket{}
+					continue
+				}
+				return nil, err
 			}
-			m.Logger.Debug("request timeout: %T (msgID=%d, attempt=%d, elapsed=%s): %v", data, msgID, attempt+1, time.Since(start), ctx.Err())
-			return nil, fmt.Errorf("request timeout: %w", ctx.Err())
-		case resp, ok := <-respChan:
-			if !ok {
-				return nil, errors.New("response channel closed")
+			if isNullableResponse(data) {
+				return tl.UnwrapNativeTypes(<-respChan), nil
 			}
-			response = resp
+
+			start = time.Now()
+			if retryTimer != nil {
+				retryTimer.Reset(retryInterval)
+			}
+			if msgID != 0 {
+				m.messageTracker.Add(msgID, start.Unix())
+				m.messageTypesMap.Store(msgID, fmt.Sprintf("%T", data))
+				m.Logger.Trace("request sent: %T (msgID=%d, attempt=%d)", data, msgID, attempt+1)
+			}
+
+			select {
+			case <-ctx.Done():
+				silent := time.Since(start) >= time.Second && m.lastRecv.Load() < start.UnixNano()
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) && silent {
+					count := m.connState.ConsecutiveTimeouts.Add(1)
+					if count == 1 {
+						m.connState.ConsecutiveTimeoutStart.Store(time.Now().Unix())
+					}
+					if count >= 5 {
+						duration := time.Now().Unix() - m.connState.ConsecutiveTimeoutStart.Load()
+						m.connState.ConsecutiveTimeouts.Store(0)
+						if duration < 60 {
+							m.Logger.Debug("5 consecutive timeouts in %ds; reconnecting", duration)
+							m.requestReconnect()
+						}
+					}
+				} else if !silent {
+					m.connState.ConsecutiveTimeouts.Store(0)
+				}
+				m.Logger.Debug("request timeout: %T (msgID=%d, attempt=%d, elapsed=%s): %v", data, msgID, attempt+1, time.Since(start), ctx.Err())
+				return nil, fmt.Errorf("request timeout: %w", ctx.Err())
+			case <-retry:
+				m.Logger.Trace("request unanswered: %T (msgID=%d), retransmitting", data, msgID)
+				continue
+			case <-packet.changed:
+				if maxAttempts == 1 {
+					return nil, ErrConnectionChanged
+				}
+				continue
+			case response = <-packet.envelopeResponse:
+				envelopeResponse = true
+			case resp, ok := <-respChan:
+				if !ok {
+					return nil, errors.New("response channel closed")
+				}
+				response = resp
+			}
 		}
 
 		m.connState.ConsecutiveTimeouts.Store(0)
 		m.Logger.Trace("response received: %T -> %T (msgID=%d, latency=%s, attempt=%d)", data, response, msgID, time.Since(start), attempt+1)
-		cleanup()
+		if changed, ok := response.(*errorSessionConfigsChanged); ok && changed.connection {
+			if maxAttempts == 1 {
+				return nil, changed
+			}
+			continue
+		}
+		if envelopeResponse {
+			cleanupEnvelope()
+		} else {
+			cleanup()
+		}
 
 		switch r := response.(type) {
 		case *BadMsgError:
@@ -1162,6 +1273,8 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 			if strings.Contains(rpcError.Message, "FLOOD_WAIT_") || strings.Contains(rpcError.Message, "FLOOD_PREMIUM_WAIT_") {
 				if maxAttempts > 1 && m.floodHandler != nil && m.floodHandler(rpcError) {
 					lastErr = rpcError
+					attempt++
+					packet = requestPacket{}
 					continue
 				}
 				return nil, rpcError
@@ -1173,6 +1286,12 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 			}
 			m.Logger.Trace("session config changed, retrying request")
 			lastErr = r
+			if !r.connection {
+				attempt++
+				if !envelopeResponse {
+					packet = requestPacket{}
+				}
+			}
 			continue
 		default:
 			return tl.UnwrapNativeTypes(response), nil
@@ -1187,7 +1306,7 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 	return nil, fmt.Errorf("%w (%d)", ErrRequestAttemptsExceeded, maxAttempts)
 }
 func (m *MTProto) InvokeRequestWithoutUpdate(ctx context.Context, data tl.Object, expectedTypes ...reflect.Type) error {
-	_, msgID, err := m.sendPacket(ctx, data, 0, expectedTypes...)
+	_, msgID, err := m.sendPacket(ctx, data, 0, nil, expectedTypes...)
 	if msgID != 0 {
 		m.responseChannels.Delete(msgID)
 		m.expectedTypes.Delete(msgID)
@@ -1271,10 +1390,26 @@ func (m *MTProto) Reconnect(ctx context.Context, loggy bool) error {
 	if m.terminated.Load() {
 		return nil
 	}
-	if !m.connState.InProgress.CompareAndSwap(false, true) {
+	m.reconnectMu.Lock()
+	if m.connState.InProgress.Load() {
+		op := m.reconnectOp
+		m.reconnectMu.Unlock()
 		m.Logger.Trace("reconnect already in progress")
-		return nil
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-op.done:
+			return op.err
+		}
 	}
+	op := &reconnectOperation{done: make(chan struct{})}
+	m.reconnectOp = op
+	m.connState.InProgress.Store(true)
+	m.tcpState.SetActive(false)
+	ctx, cancel := context.WithCancel(ctx)
+	m.reconnectCancel = cancel
+	m.reconnectMu.Unlock()
+	defer cancel()
 
 	addr := utils.FmtIP(m.GetAddr())
 	tx := m.GetTransportType()
@@ -1286,30 +1421,34 @@ func (m *MTProto) Reconnect(ctx context.Context, loggy bool) error {
 	log("reconnecting to %s (%s)", addr, tx)
 
 	err := m.CreateConnection(ctx, loggy, true)
-	m.finishReconnect(err == nil)
+	if utils.IsFatalConnectionError(err) {
+		m.tcpState.closeWithError(err)
+	}
+	m.finishReconnect(op, err)
 	if err != nil {
-		m.Logger.WithError(err).Error("failed to recreate connection")
+		m.Logger.WithError(err).Debug("failed to recreate connection")
 		return fmt.Errorf("recreating connection: %w", err)
 	}
 
 	log("reconnected to %s (%s) in %v", addr, tx, time.Since(start))
-	m.Ping(ctx)
 	return nil
 }
 
 func (m *MTProto) requestReconnect() {
-	if m.terminated.Load() || m.disconnected.Load() {
+	m.reconnectMu.Lock()
+	defer m.reconnectMu.Unlock()
+	if m.terminated.Load() || m.disconnected.Load() || m.tcpState.getError() != nil {
 		return
 	}
 	if !m.connState.InProgress.CompareAndSwap(false, true) {
 		return
 	}
 	m.tcpState.SetActive(false)
+	op := &reconnectOperation{done: make(chan struct{})}
+	m.reconnectOp = op
 	ctx, cancel := context.WithCancel(context.Background())
-	m.reconnectMu.Lock()
 	m.reconnectCancel = cancel
-	m.reconnectMu.Unlock()
-	go m.autoReconnect(ctx)
+	go m.autoReconnect(ctx, op)
 }
 
 func (m *MTProto) cancelAutoReconnect() {
@@ -1321,36 +1460,44 @@ func (m *MTProto) cancelAutoReconnect() {
 	m.reconnectMu.Unlock()
 }
 
-func (m *MTProto) autoReconnect(ctx context.Context) {
+func (m *MTProto) autoReconnect(ctx context.Context, op *reconnectOperation) {
 	for attempt := 0; ; attempt++ {
 		if m.terminated.Load() || m.disconnected.Load() || ctx.Err() != nil {
-			m.finishReconnect(false)
+			m.finishReconnect(op, errors.New("recovery canceled"))
 			return
 		}
 		err := m.CreateConnection(ctx, false, false)
 		if err == nil {
-			m.finishReconnect(true)
-			m.Ping(context.Background())
+			m.finishReconnect(op, nil)
 			return
 		}
-		delay := reconnectDelay(m.connConfig.BaseDelay, min(m.connConfig.MaxDelay, time.Minute), attempt)
-		if attempt == 0 {
-			m.Logger.WithError(err).Warn("auto-reconnect failed; retrying in %s", delay)
-		} else {
-			m.Logger.WithError(err).Debug("auto-reconnect attempt %d failed; retrying in %s", attempt+1, delay)
+		if terminalErr := m.tcpState.getError(); terminalErr != nil {
+			m.finishReconnect(op, terminalErr)
+			return
 		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(delay):
+		if utils.IsFatalConnectionError(err) {
+			m.tcpState.closeWithError(err)
+			m.finishReconnect(op, err)
+			return
 		}
+		m.Logger.WithError(err).Debug("auto-reconnect attempt %d failed; continuing recovery with backoff", attempt+1)
 	}
 }
 
-func (m *MTProto) finishReconnect(connected bool) {
+func (m *MTProto) finishReconnect(op *reconnectOperation, err error) {
 	m.transportMu.Lock()
 	defer m.transportMu.Unlock()
+	m.reconnectMu.Lock()
+	op.err = err
+	close(op.done)
+	if m.reconnectOp != op {
+		m.reconnectMu.Unlock()
+		return
+	}
 	m.connState.InProgress.Store(false)
-	if connected && !m.IsTcpActive() {
+	m.reconnectCancel = nil
+	m.reconnectMu.Unlock()
+	if !m.IsTcpActive() {
 		m.requestReconnect()
 	}
 }
@@ -1358,6 +1505,7 @@ func (m *MTProto) finishReconnect(connected bool) {
 // keep pinging to keep the connection alive
 func (m *MTProto) longPing(ctx context.Context) {
 	defer m.routineswg.Done()
+	m.Ping(ctx)
 
 	ticker := time.NewTicker(m.pingInterval())
 	defer ticker.Stop()
@@ -1417,7 +1565,7 @@ func (m *MTProto) httpWaiter(ctx context.Context) {
 			MaxDelay:  0,
 			WaitAfter: 0,
 			MaxWait:   25000,
-		}, 0)
+		}, 0, nil)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -1450,25 +1598,31 @@ func (m *MTProto) Ping(ctx context.Context) time.Duration {
 	return time.Since(start)
 }
 
-// checkRapidReconnect detects rapid reconnection loops that indicate connection instability
-// Uses exponential backoff naturally via reconnectAttempts counter
-func (m *MTProto) checkRapidReconnect() error {
-	now := time.Now().Unix()
-	last := m.connState.LastSuccessfulConnect.Load()
-	if last == 0 || now-last >= 5 {
-		m.connState.Attempts.Store(0)
-	}
-	attempts := m.connState.Attempts.Add(1)
-
-	if attempts > 10 {
-		m.Logger.Warn("rapid reconnection loop detected: %d attempts within 5 seconds", attempts)
-		if m.proxy != nil && m.proxy.Type == "mtproxy" {
-			return fmt.Errorf("mtproxy connection loop detected: connection succeeds but immediately closes - check proxy configuration, secret, or server availability")
+func (m *MTProto) waitReconnectDelay(ctx context.Context) error {
+	if attempts := m.connState.Attempts.Load(); attempts > 0 {
+		maximum := m.connConfig.MaxDelay
+		if m.connState.InProgress.Load() && (maximum <= 0 || maximum > time.Minute) {
+			maximum = time.Minute
 		}
-		return fmt.Errorf("rapid reconnection loop detected: connection succeeds but immediately closes - possible network or server issue")
+		delay := reconnectDelay(m.connConfig.BaseDelay, maximum, int(attempts-1))
+		remaining := time.Until(time.Unix(0, m.connState.lastConnectAttempt.Load()).Add(delay))
+		if remaining > 0 {
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
-
-	m.connState.LastSuccessfulConnect.Store(now)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.connState.lastConnectAttempt.Store(time.Now().UnixNano())
+	if m.connState.Attempts.Load() < 32 {
+		m.connState.Attempts.Add(1)
+	}
 	return nil
 }
 
@@ -1517,7 +1671,7 @@ func (m *MTProto) startReadingResponses(ctx context.Context) {
 				continue
 			}
 
-			if errors.Is(err, context.Canceled) {
+			if ctx.Err() != nil {
 				m.Logger.Trace("read message context canceled")
 				return
 			}
@@ -1525,7 +1679,7 @@ func (m *MTProto) startReadingResponses(ctx context.Context) {
 			var readErr *transportReadError
 			if errors.As(err, &readErr) {
 				if ctx.Err() == nil {
-					m.Logger.Trace("transport read failed: %v; reconnecting", err)
+					m.Logger.Debug("transport read failed (%s, DC%d): %v; reconnecting", m.GetTransportType(), m.GetDC(), err)
 					m.reconnectTransport(readErr.transport)
 				}
 				return
@@ -1551,6 +1705,8 @@ func (m *MTProto) startReadingResponses(ctx context.Context) {
 				if respErr.Code == -404 {
 					if authErr := m.handle404Error(); authErr != nil {
 						m.Logger.Error("auth key error: %v", authErr)
+						m.tcpState.closeWithError(authErr)
+						m.stopRoutines()
 						return
 					}
 				} else {
@@ -1745,9 +1901,12 @@ messageTypeSwitching:
 		}
 
 	case *objects.MsgsNewDetailedInfo:
-		return m.queueAck(message.AnswerMsgID)
+		return m.requestMissingMessage(message.AnswerMsgID)
 
 	case *objects.MsgsDetailedInfo:
+		if m.responseChannels.Has(message.MsgID) {
+			return m.requestMissingMessage(message.AnswerMsgID)
+		}
 		return m.queueAck(message.AnswerMsgID)
 
 	case *objects.MsgsStateReq:
@@ -1768,10 +1927,8 @@ messageTypeSwitching:
 
 	case *objects.MsgResendReq:
 		for _, id := range message.MsgIDs {
-			// The server asks for our outbound requests; acknowledging their IDs
-			// as inbound messages is invalid. Wake only the affected callers.
 			if m.responseChannels.Has(id) {
-				_ = m.writeRPCResponse(id, &errorSessionConfigsChanged{})
+				_ = m.writeRPCResponse(id, &errorSessionConfigsChanged{connection: true})
 			}
 		}
 		return nil
@@ -1803,7 +1960,7 @@ messageTypeSwitching:
 			localTime := time.Now().Unix()
 			offset := serverTime - localTime
 			if previous := m.timeOffset.Swap(offset); previous != offset {
-				m.Logger.Warn("system clock offset detected: %d seconds, auto-correcting", offset)
+				m.Logger.Debug("system clock offset detected: %d seconds, auto-correcting", offset)
 			}
 			_ = m.writeRPCResponse(message.BadMsgID, &errorSessionConfigsChanged{})
 			return nil
@@ -1861,13 +2018,37 @@ messageTypeSwitching:
 // notifyPendingRequestsOfConfigChange wakes all pending requests after a
 // connection transition. Individual protocol rejections target only BadMsgID.
 func (m *MTProto) notifyPendingRequestsOfConfigChange() {
-	old := m.responseChannels.SwapAndClear()
-	for msgID, ch := range old {
+	m.transportMu.Lock()
+	defer m.transportMu.Unlock()
+	for _, msgID := range m.responseChannels.Keys() {
+		if changed, ok := m.requestChanges.Load(msgID); ok {
+			select {
+			case changed.(chan struct{}) <- struct{}{}:
+			default:
+			}
+			continue
+		}
+		ch, ok := m.responseChannels.Pop(msgID)
+		if !ok {
+			continue
+		}
 		m.expectedTypes.Delete(msgID)
 		select {
 		case ch <- &errorSessionConfigsChanged{connection: true}:
 		default:
 		}
+	}
+}
+
+func (m *MTProto) requestMissingMessage(msgID int64) error {
+	if m.receivedIDs.contains(msgID) {
+		return m.queueAck(msgID)
+	}
+	select {
+	case m.serviceMessages <- &objects.MsgResendReq{MsgIDs: []int64{msgID}}:
+		return nil
+	default:
+		return errors.New("service response queue full")
 	}
 }
 
@@ -1880,6 +2061,7 @@ type TcpState struct {
 	mu     sync.RWMutex
 	active bool
 	closed bool
+	err    error
 	ch     chan struct{}
 }
 
@@ -1913,6 +2095,7 @@ func (m *TcpState) SetActive(active bool) {
 		if m.closed {
 			m.ch = make(chan struct{})
 			m.closed = false
+			m.err = nil
 		}
 		// Closing the channel releases all current waiters
 		close(m.ch)
@@ -1925,6 +2108,10 @@ func (m *TcpState) SetActive(active bool) {
 // close releases connection waiters on explicit shutdown. A later successful
 // connection reopens the state through SetActive(true).
 func (m *TcpState) close() {
+	m.closeWithError(errors.New("client is disconnected"))
+}
+
+func (m *TcpState) closeWithError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.active && !m.closed {
@@ -1932,20 +2119,40 @@ func (m *TcpState) close() {
 	}
 	m.active = false
 	m.closed = true
+	m.err = err
+}
+
+func (m *TcpState) getError() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.err
+}
+
+func (m *TcpState) resetError() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		m.closed, m.err = false, nil
+		m.ch = make(chan struct{})
+	}
 }
 
 // WaitForActive blocks until the TcpState becomes active or
 // until the connection is explicitly closed or the context is canceled.
 func (m *TcpState) WaitForActive(ctx context.Context) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		m.mu.RLock()
 		active := m.active
 		closed := m.closed
+		err := m.err
 		ch := m.ch
 		m.mu.RUnlock()
 
 		if closed {
-			return errors.New("client is disconnected")
+			return err
 		}
 		if active {
 			return nil
@@ -2113,18 +2320,22 @@ func (m *MTProto) serviceWriter(ctx context.Context) {
 		case <-m.acksReady:
 		}
 		if request != nil {
-			if _, _, err := m.sendPacket(ctx, request, 0); err != nil {
+			if err := m.InvokeRequestWithoutUpdate(ctx, request); err != nil {
 				m.Logger.Debug("service response: %v", err)
-				m.requestReconnect()
+				if ctx.Err() == nil {
+					m.requestReconnect()
+				}
 				return
 			}
 		}
 		ids := m.pendingAcks.Keys()
 		for start := 0; start < len(ids); start += maxMsgsAckPerBatch {
 			batch := ids[start:min(start+maxMsgsAckPerBatch, len(ids))]
-			if _, _, err := m.sendPacket(ctx, &objects.MsgsAck{MsgIDs: batch}, 0); err != nil {
+			if _, _, err := m.sendPacket(ctx, &objects.MsgsAck{MsgIDs: batch}, 0, nil); err != nil {
 				m.Logger.Debug("sending acknowledgments: %v", err)
-				m.requestReconnect()
+				if ctx.Err() == nil {
+					m.requestReconnect()
+				}
 				return
 			}
 			for _, id := range batch {

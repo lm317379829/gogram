@@ -616,7 +616,7 @@ func (b *counterBox) process(counter, count int32, recovered bool, apply func())
 		clear(b.pending)
 		b.pendingCount = 0
 		if b.logger != nil {
-			b.logger.Warn("counterBox=%s pending limit reached; recovering from %s=%d (target=%d)", b.name, b.name, b.current, counter)
+			b.logger.Debug("counterBox=%s pending limit reached; recovering from %s=%d (target=%d)", b.name, b.name, b.current, counter)
 		}
 	}
 	item := pendingCounter{counter: counter, count: count, apply: apply}
@@ -1109,6 +1109,8 @@ type channelState struct {
 	pts        int32
 	accessHash int64
 	isOpen     bool
+	retryAt    time.Time
+	failures   int
 }
 
 // UpdateState represents the current update state
@@ -3585,7 +3587,7 @@ func (c *Client) fetchDifference(fromPts int32, limit int32, request func(contex
 		stateRaw, err := request(ctx, &UpdatesGetStateParams{})
 		cancel()
 		if err != nil {
-			c.Log.Warn("difference bootstrap failed (qts=%d): %v", req.Qts, err)
+			c.Log.Debug("difference bootstrap failed (qts=%d): %v", req.Qts, err)
 			return
 		}
 		state, ok := stateRaw.(*UpdatesState)
@@ -3607,7 +3609,7 @@ func (c *Client) fetchDifference(fromPts int32, limit int32, request func(contex
 		cancel()
 
 		if err != nil {
-			c.Log.Warn("difference request failed (pts=%d, qts=%d, date=%d): %v", req.Pts, req.Qts, req.Date, err)
+			c.Log.Debug("difference request failed (pts=%d, qts=%d, date=%d): %v", req.Pts, req.Qts, req.Date, err)
 			return
 		}
 
@@ -3620,7 +3622,7 @@ func (c *Client) fetchDifference(fromPts int32, limit int32, request func(contex
 			current, pending := qts.current, qts.pendingCount
 			qts.Unlock()
 			if pending > 0 {
-				c.Log.Warn("difference empty with unresolved qts gap (qts=%d, pending=%d); retrying with backoff", current, pending)
+				c.Log.Debug("difference empty with unresolved qts gap (qts=%d, pending=%d); retrying with backoff", current, pending)
 			}
 			return
 
@@ -3674,7 +3676,7 @@ func (c *Client) fetchDifference(fromPts int32, limit int32, request func(contex
 			c.dispatcher.SetDate(u.IntermediateState.Date)
 
 			if u.IntermediateState.Pts <= req.Pts && u.IntermediateState.Qts <= req.Qts && u.IntermediateState.Date <= req.Date {
-				c.Log.Warn("difference slice did not advance state (pts=%d, qts=%d)", req.Pts, req.Qts)
+				c.Log.Debug("difference slice did not advance state (pts=%d, qts=%d)", req.Pts, req.Qts)
 				return
 			}
 			req.Pts = u.IntermediateState.Pts
@@ -3689,7 +3691,7 @@ func (c *Client) fetchDifference(fromPts int32, limit int32, request func(contex
 			stateRaw, err := request(ctx, &UpdatesGetStateParams{})
 			cancel()
 			if err != nil {
-				c.Log.Error("failed to get update state: %v", err)
+				c.Log.Debug("failed to get update state: %v", err)
 				return
 			}
 			state, ok := stateRaw.(*UpdatesState)
@@ -3761,9 +3763,12 @@ func (c *Client) GetDifference(Pts, Limit int32) (Message, error) {
 	return nil, nil
 }
 
-// FetchChannelDifference fetches updates difference for a specific channel
-// Use limit 10-100 as recommended for channels
+// FetchChannelDifference recovers missing channel updates. Limits above 100 are capped.
 func (c *Client) FetchChannelDifference(channelID int64, fromPts int32, limit int32) {
+	var accessHash int64
+	if peer, err := c.Cache.getChannelPeer(channelID); err == nil {
+		accessHash = peer.(*InputChannelObj).AccessHash
+	}
 	c.dispatcher.Lock()
 	if c.dispatcher.recoveringChannels == nil {
 		c.dispatcher.recoveringChannels = make(map[int64]bool)
@@ -3772,37 +3777,110 @@ func (c *Client) FetchChannelDifference(channelID int64, fromPts int32, limit in
 		c.dispatcher.Unlock()
 		return
 	}
+	if c.dispatcher.channelStates == nil {
+		c.dispatcher.channelStates = make(map[int64]*channelState)
+	}
+	state := c.dispatcher.channelStates[channelID]
+	if state == nil {
+		state = &channelState{}
+		c.dispatcher.channelStates[channelID] = state
+	}
+	if accessHash != 0 && accessHash != state.accessHash {
+		state.accessHash = accessHash
+		state.failures = 0
+		state.retryAt = time.Time{}
+	}
+	accessHash = state.accessHash
+	if time.Now().Before(state.retryAt) {
+		c.dispatcher.Unlock()
+		return
+	}
 	c.dispatcher.recoveringChannels[channelID] = true
 	c.dispatcher.Unlock()
 
+	var recoveryErr error
 	defer func() {
 		c.dispatcher.Lock()
 		delete(c.dispatcher.recoveringChannels, channelID)
+		if recoveryErr != nil {
+			state.failures = min(state.failures+1, 6)
+			state.retryAt = time.Now().Add(time.Duration(min(1<<state.failures, 60)) * time.Second)
+		} else {
+			state.failures = 0
+			state.retryAt = time.Time{}
+		}
 		c.dispatcher.Unlock()
+		if recoveryErr != nil {
+			c.Log.Debug("channel difference failed (channel=%d): %v", channelID, recoveryErr)
+		}
 	}()
 
-	if limit == 0 {
+	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 100 {
 		limit = 100
 	}
 
-	var accessHash int64
-	c.dispatcher.RLock()
-	if state := c.dispatcher.channelStates[channelID]; state != nil {
-		accessHash = state.accessHash
+	c.dispatcher.stopMu.Lock()
+	stop := c.dispatcher.stopChan
+	c.dispatcher.stopMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	select {
+	case <-stop:
+		return
+	default:
 	}
-	c.dispatcher.RUnlock()
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	if accessHash == 0 {
-		channel := c.getChannel(&PeerChannel{ChannelID: channelID})
-		if channel != nil {
-			accessHash = channel.AccessHash
-		} else {
-			c.Log.Error("channel difference failed: no access hash (channel=%d)", channelID)
+		lookupCtx, lookupCancel := context.WithTimeout(ctx, 30*time.Second)
+		result, err := c.MTProto.MakeRequest(lookupCtx, &ChannelsGetChannelsParams{
+			ID: []InputChannel{&InputChannelObj{ChannelID: channelID}},
+		})
+		lookupCancel()
+		if ctx.Err() != nil {
 			return
 		}
+		if err != nil {
+			recoveryErr = fmt.Errorf("access hash lookup: %w", err)
+			return
+		}
+		var chats []Chat
+		switch result := result.(type) {
+		case *MessagesChatsObj:
+			chats = result.Chats
+		case *MessagesChatsSlice:
+			chats = result.Chats
+		}
+		for _, chat := range chats {
+			var channel *Channel
+			switch ch := chat.(type) {
+			case *Channel:
+				channel = ch
+			case *Community:
+				channel = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title, Min: ch.Min}
+			}
+			if channel != nil && channel.ID == channelID && !channel.Min && channel.AccessHash != 0 {
+				accessHash = channel.AccessHash
+				c.Cache.UpdateChannel(channel)
+				break
+			}
+		}
+		if accessHash == 0 {
+			recoveryErr = fmt.Errorf("no usable access hash in channel lookup (%T)", result)
+			return
+		}
+		c.dispatcher.Lock()
+		state.accessHash = accessHash
+		c.dispatcher.Unlock()
 	}
 
 	req := &UpdatesGetChannelDifferenceParams{
@@ -3813,28 +3891,27 @@ func (c *Client) FetchChannelDifference(channelID int64, fromPts int32, limit in
 		Limit:   limit,
 	}
 
-	c.dispatcher.stopMu.Lock()
-	stop := c.dispatcher.stopChan
-	c.dispatcher.stopMu.Unlock()
 	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		diff, err := c.MTProto.MakeRequest(ctx, req)
-		cancel()
+		requestCtx, requestCancel := context.WithTimeout(ctx, 30*time.Second)
+		diff, err := c.MTProto.MakeRequest(requestCtx, req)
+		requestCancel()
 
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
-			c.Log.Debug("channel difference request failed (channel=%d): %v", channelID, err)
+			recoveryErr = err
 			return
 		}
 
 		switch d := diff.(type) {
 		case *UpdatesChannelDifferenceEmpty:
 			c.dispatcher.SetChannelPts(channelID, d.Pts)
-			if d.Final || d.Pts <= req.Pts {
+			if d.Final {
+				return
+			}
+			if d.Pts <= req.Pts {
+				recoveryErr = fmt.Errorf("channel difference did not advance pts (%d <= %d)", d.Pts, req.Pts)
 				return
 			}
 			req.Pts = d.Pts
@@ -3859,7 +3936,7 @@ func (c *Client) FetchChannelDifference(channelID int64, fromPts int32, limit in
 				return
 			}
 			if d.Pts <= req.Pts {
-				c.Log.Debug("channel difference did not advance pts (channel=%d, pts=%d)", channelID, req.Pts)
+				recoveryErr = fmt.Errorf("channel difference did not advance pts (%d <= %d)", d.Pts, req.Pts)
 				return
 			}
 
@@ -3874,20 +3951,24 @@ func (c *Client) FetchChannelDifference(channelID int64, fromPts int32, limit in
 				}
 			}
 
-			if dialogChannel, ok := d.Dialog.(*DialogObj); ok {
-				c.dispatcher.SetChannelPts(channelID, dialogChannel.Pts)
-				c.Log.Debug("channel difference too long, refreshing state (channel=%d, pts=%d)", channelID, dialogChannel.Pts)
-
-				if !d.Final && dialogChannel.Pts > req.Pts {
-					req.Pts = dialogChannel.Pts
-					continue
-				}
+			dialogChannel, ok := d.Dialog.(*DialogObj)
+			if !ok {
+				recoveryErr = fmt.Errorf("unexpected channel difference dialog %T", d.Dialog)
+				return
 			}
-
-			return
+			c.dispatcher.SetChannelPts(channelID, dialogChannel.Pts)
+			c.Log.Debug("channel difference too long, refreshing state (channel=%d, pts=%d)", channelID, dialogChannel.Pts)
+			if d.Final {
+				return
+			}
+			if dialogChannel.Pts <= req.Pts {
+				recoveryErr = fmt.Errorf("channel difference did not advance pts (%d <= %d)", dialogChannel.Pts, req.Pts)
+				return
+			}
+			req.Pts = dialogChannel.Pts
 
 		default:
-			c.Log.Debug("unhandled channel difference type: %T (channel=%d)", diff, channelID)
+			recoveryErr = fmt.Errorf("unexpected channel difference type %T", diff)
 			return
 		}
 	}

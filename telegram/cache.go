@@ -1040,6 +1040,11 @@ func (c *CACHE) UpdateChannel(channel *Channel) bool {
 		return false
 	}
 
+	if channel.AccessHash == 0 && c.InputPeers.InputChannels[channel.ID] != 0 {
+		copy := *channel
+		copy.AccessHash = c.InputPeers.InputChannels[channel.ID]
+		channel = &copy
+	}
 	c.channels[channel.ID] = channel
 	delete(c.minChannels, channel.ID)
 
@@ -1143,31 +1148,9 @@ func (cache *CACHE) UpdatePeersToCache(users []User, chats []Chat) {
 			cache.enforceSizeLimit()
 			cache.Unlock()
 		case *Community:
-			cache.Lock()
-			if ch.Min {
-				if existing, ok := cache.channels[ch.ID]; !ok || existing.Min {
-					cache.channels[ch.ID] = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title, Min: true}
-					if ch.AccessHash != 0 {
-						if _, hasReal := cache.InputPeers.InputChannels[ch.ID]; !hasReal {
-							cache.minChannels[ch.ID] = ch.AccessHash
-						}
-					}
-				}
-			} else {
-				cache.channels[ch.ID] = &Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title}
-				delete(cache.minChannels, ch.ID)
-				if curr, ok := cache.InputPeers.InputChannels[ch.ID]; !ok || curr != ch.AccessHash {
-					cache.InputPeers.InputChannels[ch.ID] = ch.AccessHash
-					cache.touchChannelLRU(ch.ID)
-					cache.enforceSizeLimit()
-					totalUpdates[1]++
-				} else {
-					cache.touchChannelLRU(ch.ID)
-				}
+			if cache.UpdateChannel(&Channel{ID: ch.ID, AccessHash: ch.AccessHash, Title: ch.Title, Min: ch.Min}) {
+				totalUpdates[1]++
 			}
-			cache.touchChannelLRU(ch.ID)
-			cache.enforceSizeLimit()
-			cache.Unlock()
 		case *CommunityForbidden:
 			cache.Lock()
 			if _, ok := cache.InputPeers.InputChannels[ch.ID]; !ok {
