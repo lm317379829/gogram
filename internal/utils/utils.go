@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -477,15 +478,9 @@ func (p *Proxy) String() string {
 		return ""
 	}
 	if p.Type == "mtproxy" {
-		return fmt.Sprintf("mtproxy://%s@%s:%d", p.Secret, p.Host, p.Port)
+		return fmt.Sprintf("mtproxy://%s@%s", p.Secret, net.JoinHostPort(p.Host, strconv.Itoa(p.Port)))
 	}
-	if p.Username != "" {
-		if p.Password != "" {
-			return fmt.Sprintf("%s://%s:%s@%s:%d", p.Type, p.Username, p.Password, p.Host, p.Port)
-		}
-		return fmt.Sprintf("%s://%s@%s:%d", p.Type, p.Username, p.Host, p.Port)
-	}
-	return fmt.Sprintf("%s://%s:%d", p.Type, p.Host, p.Port)
+	return p.ToURL().String()
 }
 
 func (p *Proxy) ToURL() *url.URL {
@@ -495,7 +490,7 @@ func (p *Proxy) ToURL() *url.URL {
 
 	u := &url.URL{
 		Scheme: p.Type,
-		Host:   fmt.Sprintf("%s:%d", p.Host, p.Port),
+		Host:   net.JoinHostPort(strings.Trim(p.Host, "[]"), strconv.Itoa(p.Port)),
 	}
 
 	if p.Username != "" {

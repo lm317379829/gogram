@@ -163,10 +163,10 @@ type ClientConfig struct {
 	ReqTimeout       int                                       // RPC request timeout in seconds (default: 60)
 	Transport        TransportType                             // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
 	Obfuscated       bool                                      // Wrap TCP transport with mtproto obfuscation (only meaningful for TransportTCP)
-	HTTPPath         string                                    // HTTP request path (default "/api"; only used for HTTP/HTTPS)
+	HTTPPath         string                                    // Override the HTTP/HTTPS request path (defaults to "/api", or "/apiw1" on Telegram web endpoints)
 	EnablePFS        bool                                      // Enable Perfect Forward Secrecy with temp auth keys
 	PFSKeyLifetime   int32                                     // Lifetime (seconds) for PFS temp key; 0 = 24h
-	DisableGapFetch  bool                                      // Disable automatic gap filling, only fetch difference on UpdatesTooLong/UpdateChannelTooLong
+	DisableGapFetch  bool                                      // Disable per-counter gap fetching; ordering still buffers gaps. Explicit/too-long/idle recovery remains enabled.
 	RawUpdates       bool                                      // Enable raw update mode, bypassing pts/qts gap tracking but still dispatching updates to handlers
 	UpdateWorkers    int                                       // Maximum concurrent update tasks (default: 64).
 	UpdateQueueSize  int                                       // Maximum queued update tasks (default: 10000). Overflow is dropped with a warning.
@@ -375,7 +375,9 @@ func (c *Client) cleanClientConfig(config ClientConfig) ClientConfig {
 	// if config.Session is a filename, join it with the working directory
 	config.Session = joinAbsWorkingDir(config.Session)
 	if config.TestMode {
-		config.DataCenter = 2
+		if config.DataCenter < 1 || config.DataCenter > 3 {
+			config.DataCenter = 2
+		}
 	} else {
 		config.DataCenter = getValue(config.DataCenter, DefaultDataCenter)
 	}
@@ -605,9 +607,17 @@ func (c *Client) resetBackground() {
 // Returns true if the client is authorized as a user or a bot
 func (c *Client) IsAuthorized() (bool, error) {
 	c.Log.Debug("checking auth status")
-	_, err := c.UpdatesGetState()
+	state, err := c.UpdatesGetState()
 	if err != nil {
 		return false, err
+	}
+	if d := c.dispatcher; d != nil {
+		d.globalPtsBox.initialize(state.Pts)
+		d.globalQtsBox.initialize(state.Qts)
+		d.globalSeqBox.initialize(state.Seq)
+		if d.GetDate() == 0 {
+			d.SetDate(state.Date)
+		}
 	}
 	return true, nil
 }
@@ -689,6 +699,10 @@ func (c *Client) shutdownBackground(discardUpdates bool) {
 			box.recovering = false
 			box.gapFailures = 0
 			box.lastGapAt = time.Time{}
+			if discardUpdates {
+				clear(box.pending)
+				box.pendingCount = 0
+			}
 			box.Unlock()
 		}
 	}
@@ -720,15 +734,15 @@ func (c *Client) SetAppHash(appHash string) {
 }
 
 func (c *Client) Me() *UserObj {
-	if cached := c.getMe(); cached != nil {
-		return cached
-	}
-	me, err := c.GetMe()
-	if err != nil {
-		return &UserObj{}
-	}
-	c.setMe(me)
+	me, _ := c.self()
 	return me
+}
+
+func (c *Client) self() (*UserObj, error) {
+	if cached := c.getMe(); cached != nil {
+		return cached, nil
+	}
+	return c.GetMe()
 }
 
 type ExSenders struct {
@@ -822,15 +836,8 @@ func NewExSenders() *ExSenders {
 
 func (es *ExSenders) ensureRunning() {
 	es.Lock()
-	if es.running {
-		es.Unlock()
-		return
-	}
-	es.cleanupDone = make(chan struct{})
 	es.running = true
-	done := es.cleanupDone
 	es.Unlock()
-	go es.cleanupLoop(done)
 }
 
 func (es *ExSenders) cleanupLoop(done <-chan struct{}) {
@@ -840,7 +847,9 @@ func (es *ExSenders) cleanupLoop(done <-chan struct{}) {
 	for {
 		select {
 		case <-ticker.C:
-			es.cleanupIdleSenders()
+			if es.cleanupIdleSendersFor(done) {
+				return
+			}
 		case <-done:
 			return
 		}
@@ -848,27 +857,42 @@ func (es *ExSenders) cleanupLoop(done <-chan struct{}) {
 }
 
 func (es *ExSenders) cleanupIdleSenders() {
+	es.cleanupIdleSendersFor(nil)
+}
+
+func (es *ExSenders) cleanupIdleSendersFor(done <-chan struct{}) bool {
 	es.Lock()
-	defer es.Unlock()
-
-	for _, senders := range es.senders {
-		for i, sender := range senders {
-			if time.Since(sender.GetLastUsedTime()) > 30*time.Minute {
-				sender.Terminate()
-				senders[i] = nil
-			}
-		}
+	if done != nil && es.cleanupDone != done {
+		es.Unlock()
+		return true
 	}
-
+	var toTerminate []*ExSender
 	for dcID, senders := range es.senders {
-		var newSenders []*ExSender
+		var keep []*ExSender
 		for _, sender := range senders {
-			if sender != nil {
-				newSenders = append(newSenders, sender)
+			if time.Since(sender.GetLastUsedTime()) > 30*time.Minute {
+				toTerminate = append(toTerminate, sender)
+			} else {
+				keep = append(keep, sender)
 			}
 		}
-		es.senders[dcID] = newSenders
+		if len(keep) == 0 {
+			delete(es.senders, dcID)
+		} else {
+			es.senders[dcID] = keep
+		}
 	}
+	empty := len(es.senders) == 0
+	if empty && es.cleanupDone != nil {
+		close(es.cleanupDone)
+		es.cleanupDone = nil
+	}
+	es.Unlock()
+
+	for _, sender := range toTerminate {
+		sender.Terminate()
+	}
+	return empty
 }
 
 // GetSenders returns a copy of the senders for the given DC
@@ -886,15 +910,20 @@ func (es *ExSenders) GetSenders(dcID int) []*ExSender {
 
 // AddSender adds a sender for the given DC
 func (es *ExSenders) AddSender(dcID int, sender *ExSender) {
+	if sender == nil || sender.MTProto == nil {
+		return
+	}
 	es.Lock()
 	if !es.running {
 		es.Unlock()
-		if sender != nil && sender.MTProto != nil {
-			_ = sender.Terminate()
-		}
+		_ = sender.Terminate()
 		return
 	}
 	es.senders[dcID] = append(es.senders[dcID], sender)
+	if es.cleanupDone == nil {
+		es.cleanupDone = make(chan struct{})
+		go es.cleanupLoop(es.cleanupDone)
+	}
 	es.Unlock()
 }
 

@@ -335,11 +335,56 @@ func (c *Client) processUpdate(upd Updates) *MessageObj {
 }
 
 func (c *Client) GetSendablePeer(PeerID any) (InputPeer, error) {
+	if v := reflect.ValueOf(PeerID); v.Kind() == reflect.Pointer && v.IsNil() {
+		return nil, fmt.Errorf("peer is a nil %T", PeerID)
+	}
+	switch p := PeerID.(type) {
+	case *PeerChat:
+		if p.ChatID == 0 {
+			return nil, fmt.Errorf("invalid chat peer: missing ID")
+		}
+	case *PeerChannel:
+		if p.ChannelID == 0 {
+			return nil, fmt.Errorf("invalid channel peer: missing ID")
+		}
+	}
+	peer, err := c.getSendablePeer(PeerID)
+	if err != nil {
+		return nil, err
+	}
+
+	switch p := peer.(type) {
+	case nil:
+		return nil, fmt.Errorf("could not resolve peer %T", PeerID)
+	case *InputPeerUser:
+		if p == nil || p.UserID == 0 {
+			return nil, fmt.Errorf("invalid user peer: missing ID")
+		}
+	case *InputPeerChat:
+		if p == nil || p.ChatID == 0 {
+			return nil, fmt.Errorf("invalid chat peer: missing ID")
+		}
+	case *InputPeerChannel:
+		if p == nil || p.ChannelID == 0 {
+			return nil, fmt.Errorf("invalid channel peer: missing ID")
+		}
+	default:
+		if v := reflect.ValueOf(peer); v.Kind() == reflect.Pointer && v.IsNil() {
+			return nil, fmt.Errorf("could not resolve peer %T", PeerID)
+		}
+	}
+	return peer, nil
+}
+
+func (c *Client) getSendablePeer(PeerID any) (InputPeer, error) {
 PeerSwitch:
 	switch Peer := PeerID.(type) {
 	case nil:
 		return nil, fmt.Errorf("peer is nil, cannot send nil peer")
 	case *PeerUser:
+		if Peer == nil || Peer.UserID == 0 {
+			return nil, fmt.Errorf("invalid user peer: missing ID")
+		}
 		peerEntity, err := c.GetPeerUser(Peer.UserID)
 		if err != nil {
 			return nil, err
@@ -358,9 +403,15 @@ PeerSwitch:
 	case *InputPeerChannel:
 		return Peer, nil
 	case *InputPeerUser:
+		if Peer == nil || Peer.UserID == 0 {
+			return nil, fmt.Errorf("invalid user peer: missing ID")
+		}
 		return Peer, nil
 	case *InputPeer:
-		return *Peer, nil
+		if Peer == nil {
+			return nil, fmt.Errorf("peer is nil")
+		}
+		return c.GetSendablePeer(*Peer)
 	case *InputUserSelf:
 		return &InputPeerSelf{}, nil
 	case *InputPeerSelf:
@@ -372,6 +423,9 @@ PeerSwitch:
 	case *InputPeerChannelFromMessage:
 		return Peer, nil
 	case *InputUserObj:
+		if Peer == nil || Peer.UserID == 0 {
+			return nil, fmt.Errorf("invalid user peer: missing ID")
+		}
 		return &InputPeerUser{UserID: Peer.UserID, AccessHash: Peer.AccessHash}, nil
 	case *InputChannelObj:
 		return &InputPeerChannel{ChannelID: Peer.ChannelID, AccessHash: Peer.AccessHash}, nil
@@ -380,6 +434,9 @@ PeerSwitch:
 	case *Channel:
 		return &InputPeerChannel{ChannelID: Peer.ID, AccessHash: Peer.AccessHash}, nil
 	case *UserObj:
+		if Peer == nil || Peer.ID == 0 {
+			return nil, fmt.Errorf("invalid user peer: missing ID; use GetMe to check lookup errors")
+		}
 		return &InputPeerUser{UserID: Peer.ID, AccessHash: Peer.AccessHash}, nil
 	case int64, int32, int:
 		peerEntity, err := c.GetInputPeer(getAnyInt(PeerID))
@@ -426,7 +483,7 @@ PeerSwitch:
 		case *ChatForbidden:
 			return &InputPeerChat{ChatID: peerEntity.ID}, nil
 		default:
-			return nil, fmt.Errorf("unknown peer type %s", reflect.TypeOf(peerEntity).String())
+			return nil, fmt.Errorf("unknown peer type %T", peerEntity)
 		}
 	case *UserFull:
 		if peerEntity, err := c.GetPeerUser(Peer.ID); err == nil {
@@ -483,6 +540,8 @@ func (c *Client) GetSendableUser(PeerID any) (InputUser, error) {
 	}
 
 	switch rawPeer := rawPeer.(type) {
+	case *InputPeerSelf:
+		return &InputUserSelf{}, nil
 	case *InputPeerUser:
 		return &InputUserObj{UserID: rawPeer.UserID, AccessHash: rawPeer.AccessHash}, nil
 	case *InputPeerUserFromMessage:
@@ -574,7 +633,12 @@ func (c *Client) GetPeerType(Peer any) string {
 }
 
 func (c *Client) IsSelf(Peer any) bool {
-	return c.GetPeerID(Peer) == c.Me().ID
+	id := c.GetPeerID(Peer)
+	if id == 0 {
+		return false
+	}
+	me := c.Me()
+	return me != nil && id == me.ID
 }
 
 func (c *Client) PeerEquals(a, b any) bool {
@@ -1448,7 +1512,11 @@ func packMessage(c *Client, message Message) *NewMessage {
 	}
 
 	if m.Message.Out {
-		m.Sender = c.Me()
+		if me := c.Me(); me != nil {
+			m.Sender = me
+		} else if m.Message.FromID != nil {
+			m.Sender = c.getSender(m.Message.FromID)
+		}
 	} else if _, empty := message.(*MessageEmpty); !empty {
 		if m.Message.FromID != nil {
 			m.Sender = c.getSender(m.Message.FromID)

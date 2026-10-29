@@ -7,11 +7,10 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
-
-	"errors"
 
 	ige "github.com/amarnathcjd/gogram/internal/aes_ige"
 	"github.com/amarnathcjd/gogram/internal/encoding/tl"
@@ -278,10 +277,10 @@ dhGenSuccess:
 
 	if isTemp {
 		m.authMu.Lock()
-		m.tempAuthKey = authKey
-		m.tempAuthKeyHash = utils.AuthKeyHash(authKey)
-		m.tempAuthExpiresAt = time.Now().Unix() + int64(expiresIn)
-		m.tempServerSalt = newSalt
+		m.tempAuth.key = authKey
+		m.tempAuth.keyHash = utils.AuthKeyHash(authKey)
+		m.tempAuth.expiresAt = time.Now().Unix() + int64(expiresIn)
+		m.tempAuth.serverSalt = newSalt
 		m.authMu.Unlock()
 		m.serverSalt.Store(newSalt)
 	} else {
@@ -326,11 +325,18 @@ func (m *MTProto) createTempAuthKey(parent context.Context, expiresIn int32) err
 	if err != nil {
 		return fmt.Errorf("createTempAuthKey: creating temp MTProto: %w", err)
 	}
-	defer tmp.Terminate() // Ensure cleanup in all cases
+	defer tmp.Terminate()
+	if err := tmp.lifecycleMu.Lock(parent); err != nil {
+		return err
+	}
+	defer tmp.lifecycleMu.Unlock()
 
 	tmp.mode = m.mode
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	tmp.ctxCancelMutex.Lock()
+	tmp.ctxCancel = cancel
+	tmp.ctxCancelMutex.Unlock()
 
 	if err := tmp.connect(ctx); err != nil {
 		return fmt.Errorf("createTempAuthKey: connecting temp MTProto: %w", err)
@@ -341,13 +347,16 @@ func (m *MTProto) createTempAuthKey(parent context.Context, expiresIn int32) err
 	if err := tmp.makeAuthKey(ctx, expiresIn); err != nil {
 		return fmt.Errorf("createTempAuthKey: makeTempAuthKey on temp connection: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	m.authMu.Lock()
 	tmp.authMu.RLock()
-	m.pendingTempAuthKey = bytes.Clone(tmp.tempAuthKey)
-	m.pendingTempKeyHash = bytes.Clone(tmp.tempAuthKeyHash)
-	m.pendingTempExpiresAt = tmp.tempAuthExpiresAt
-	m.pendingTempSalt = tmp.tempServerSalt
+	m.tempAuth.pendingKey = bytes.Clone(tmp.tempAuth.key)
+	m.tempAuth.pendingKeyHash = bytes.Clone(tmp.tempAuth.keyHash)
+	m.tempAuth.pendingExpiresAt = tmp.tempAuth.expiresAt
+	m.tempAuth.pendingSalt = tmp.tempAuth.serverSalt
 	tmp.authMu.RUnlock()
 	m.authMu.Unlock()
 
@@ -360,9 +369,9 @@ func (m *MTProto) bindTempAuthKey(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, m.reqTimeout)
 	defer cancel()
 	m.authMu.RLock()
-	newKey := bytes.Clone(m.pendingTempAuthKey)
+	newKey := bytes.Clone(m.tempAuth.pendingKey)
 	permKey := bytes.Clone(m.authKey)
-	expiresAt := m.pendingTempExpiresAt
+	expiresAt := m.tempAuth.pendingExpiresAt
 	m.authMu.RUnlock()
 	if len(newKey) != 256 || len(permKey) != 256 {
 		return errors.New("bindTempAuthKey: missing authorization key")
@@ -400,7 +409,7 @@ func (m *MTProto) bindTempAuthKey(parent context.Context) error {
 		}
 		payload := append(append(bytes.Clone(permHash), msgKey...), encrypted...)
 		params := &objects.AuthBindTempAuthKeyParams{PermAuthKeyID: permID, Nonce: nonce, ExpiresAt: int32(expiresAt), EncryptedMessage: payload}
-		return m.sendPacket(ctx, params, msgID)
+		return m.sendPacket(ctx, params, msgID, nil)
 	}
 	ch, id, err := send()
 	if err != nil {
@@ -427,20 +436,20 @@ func (m *MTProto) bindTempAuthKey(parent context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !bytes.Equal(permKey, m.authKey) || !bytes.Equal(newKey, m.pendingTempAuthKey) {
+	if !bytes.Equal(permKey, m.authKey) || !bytes.Equal(newKey, m.tempAuth.pendingKey) {
 		return errors.New("authorization changed during temporary key binding")
 	}
-	if m.pendingTempExpiresAt <= time.Now().Unix() {
+	if m.tempAuth.pendingExpiresAt <= time.Now().Unix() {
 		return errors.New("bindTempAuthKey: temporary key expired while binding")
 	}
-	m.previousTempAuthKey, m.previousTempKeyHash = m.tempAuthKey, m.tempAuthKeyHash
-	m.previousTempSalt = m.tempServerSalt
-	m.tempAuthKey, m.tempAuthKeyHash = m.pendingTempAuthKey, m.pendingTempKeyHash
-	m.tempServerSalt = m.pendingTempSalt
-	m.tempAuthExpiresAt = m.pendingTempExpiresAt
-	m.pendingTempAuthKey = nil
-	m.pendingTempKeyHash = nil
-	m.pendingTempExpiresAt = 0
-	m.pendingTempSalt = 0
+	m.tempAuth.previousKey, m.tempAuth.previousKeyHash = m.tempAuth.key, m.tempAuth.keyHash
+	m.tempAuth.previousSalt = m.tempAuth.serverSalt
+	m.tempAuth.key, m.tempAuth.keyHash = m.tempAuth.pendingKey, m.tempAuth.pendingKeyHash
+	m.tempAuth.serverSalt = m.tempAuth.pendingSalt
+	m.tempAuth.expiresAt = m.tempAuth.pendingExpiresAt
+	m.tempAuth.pendingKey = nil
+	m.tempAuth.pendingKeyHash = nil
+	m.tempAuth.pendingExpiresAt = 0
+	m.tempAuth.pendingSalt = 0
 	return nil
 }

@@ -5,6 +5,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -37,9 +38,13 @@ func dialProxyContext(ctx context.Context, s *url.URL, address, localAddr string
 	}
 	port := s.Port()
 	if port == "" {
-		port = "1080"
-		if s.Scheme == "http" {
+		switch s.Scheme {
+		case "http":
 			port = "8080"
+		case "https":
+			port = "443"
+		default:
+			port = "1080"
 		}
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(s.Hostname(), port))
@@ -84,6 +89,13 @@ func dialProxyContext(ctx context.Context, s *url.URL, address, localAddr string
 	case "socks4":
 		err = socks4Handshake(conn, address)
 	case "http":
+		return httpProxyHandshake(conn, s, address)
+	case "https":
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: s.Hostname(), MinVersion: tls.VersionTLS12})
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("proxy TLS handshake: %w", err)
+		}
+		conn = tlsConn
 		return httpProxyHandshake(conn, s, address)
 	default:
 		err = fmt.Errorf("unsupported proxy scheme: %s", s.Scheme)

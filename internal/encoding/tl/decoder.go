@@ -345,6 +345,16 @@ func (d *Decoder) decodeRegisteredObject() Object {
 		return nil
 	}
 
+	if _typ.Kind() != reflect.Pointer {
+		v := reflect.New(_typ).Elem()
+		v.SetUint(uint64(crc))
+		if o, ok := v.Interface().(Object); ok {
+			return o
+		}
+		d.err = fmt.Errorf("registered type %s for crc 0x%08x is not an object", _typ, crc)
+		return nil
+	}
+
 	o := reflect.New(_typ.Elem()).Interface().(Object)
 
 	if m, ok := o.(Unmarshaler); ok {

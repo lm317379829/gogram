@@ -327,16 +327,22 @@ type HttpProxy struct {
 	BaseProxy
 	Username string
 	Password string
+	TLS      bool
 }
 
-func (h *HttpProxy) Type() string        { return "http" }
+func (h *HttpProxy) Type() string {
+	if h.TLS {
+		return "https"
+	}
+	return "http"
+}
 func (h *HttpProxy) GetUsername() string { return h.Username }
 func (h *HttpProxy) GetPassword() string { return h.Password }
 func (h *HttpProxy) GetSecret() string   { return "" }
 
 func (h *HttpProxy) toInternal() *utils.Proxy {
 	return &utils.Proxy{
-		Type:     "http",
+		Type:     h.Type(),
 		Host:     h.Host,
 		Port:     h.Port,
 		Username: h.Username,
@@ -380,66 +386,55 @@ func ProxyFromURL(proxyURL string) (Proxy, error) {
 	if err != nil {
 		matches := proxyURLRegex.FindStringSubmatch(proxyURL)
 		if len(matches) == 4 {
-			port, perr := strconv.Atoi(matches[3])
+			port, perr := parseProxyPort(matches[3])
 			if perr != nil {
-				return nil, fmt.Errorf("invalid proxy port %q: %w", matches[3], perr)
+				return nil, perr
 			}
-			return &MTProxy{
-				BaseProxy: BaseProxy{
-					Host: matches[2],
-					Port: port,
-				},
-				Secret: matches[1],
-			}, nil
+			return &MTProxy{BaseProxy: BaseProxy{Host: matches[2], Port: port}, Secret: matches[1]}, nil
 		}
 		return nil, fmt.Errorf("invalid proxy URL: %w", err)
 	}
 
 	scheme := strings.ToLower(u.Scheme)
 
-	if (scheme == "http" || scheme == "https") && strings.Contains(u.Host, "t.me") && strings.HasPrefix(u.Path, "/proxy") {
-		scheme = "tg"
+	if scheme == "tg" || ((scheme == "http" || scheme == "https") && isTelegramHost(u.Hostname())) {
+		kind := strings.ToLower(u.Host)
+		if scheme != "tg" {
+			kind = strings.ToLower(strings.Trim(u.Path, "/"))
+		}
+		return proxyFromShareLink(kind, u.Query())
 	}
 
 	var port int
-	portStr := u.Port()
-	if portStr != "" {
-		p, perr := strconv.Atoi(portStr)
-		if perr != nil {
-			return nil, fmt.Errorf("invalid proxy port %q: %w", portStr, perr)
+	if portStr := u.Port(); portStr != "" {
+		if port, err = parseProxyPort(portStr); err != nil {
+			return nil, err
 		}
-		port = p
 	} else {
 		switch scheme {
 		case "socks4", "socks4a", "socks5", "socks5h":
 			port = 1080
 		case "http":
 			port = 8080
-		case "https", "mtproxy", "tg":
+		case "https", "mtproxy":
 			port = 443
 		}
+	}
+	host := u.Hostname()
+	if host == "" {
+		return nil, errors.New("proxy URL has no host")
 	}
 
 	switch scheme {
 	case "socks4", "socks4a":
-		proxy := &Socks4Proxy{
-			BaseProxy: BaseProxy{
-				Host: u.Hostname(),
-				Port: port,
-			},
-		}
+		proxy := &Socks4Proxy{BaseProxy: BaseProxy{Host: host, Port: port}}
 		if u.User != nil {
 			proxy.UserID = u.User.Username()
 		}
 		return proxy, nil
 
 	case "socks5", "socks5h":
-		proxy := &Socks5Proxy{
-			BaseProxy: BaseProxy{
-				Host: u.Hostname(),
-				Port: port,
-			},
-		}
+		proxy := &Socks5Proxy{BaseProxy: BaseProxy{Host: host, Port: port}}
 		if u.User != nil {
 			proxy.Username = u.User.Username()
 			proxy.Password, _ = u.User.Password()
@@ -447,12 +442,7 @@ func ProxyFromURL(proxyURL string) (Proxy, error) {
 		return proxy, nil
 
 	case "http", "https":
-		proxy := &HttpProxy{
-			BaseProxy: BaseProxy{
-				Host: u.Hostname(),
-				Port: port,
-			},
-		}
+		proxy := &HttpProxy{BaseProxy: BaseProxy{Host: host, Port: port}, TLS: scheme == "https"}
 		if u.User != nil {
 			proxy.Username = u.User.Username()
 			proxy.Password, _ = u.User.Password()
@@ -460,41 +450,59 @@ func ProxyFromURL(proxyURL string) (Proxy, error) {
 		return proxy, nil
 
 	case "mtproxy":
-		proxy := &MTProxy{
-			BaseProxy: BaseProxy{
-				Host: u.Hostname(),
-				Port: port,
-			},
-		}
+		proxy := &MTProxy{BaseProxy: BaseProxy{Host: host, Port: port}}
 		if u.User != nil {
 			proxy.Secret = u.User.Username()
 		}
+		if proxy.Secret == "" {
+			return nil, errors.New("mtproxy URL has no secret")
+		}
 		return proxy, nil
-
-	case "tg":
-		// Format: tg://proxy?server=host&port=port&secret=secret
-		q := u.Query()
-		host := q.Get("server")
-		if host == "" {
-			host = u.Hostname()
-		}
-		if portQuery := q.Get("port"); portQuery != "" {
-			p, perr := strconv.Atoi(portQuery)
-			if perr != nil {
-				return nil, fmt.Errorf("invalid tg proxy port %q: %w", portQuery, perr)
-			}
-			port = p
-		}
-		return &MTProxy{
-			BaseProxy: BaseProxy{
-				Host: host,
-				Port: port,
-			},
-			Secret: q.Get("secret"),
-		}, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme: %s", scheme)
+	}
+}
+
+func isTelegramHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "t.me" || host == "telegram.me" || host == "www.t.me" || host == "telegram.dog"
+}
+
+func parseProxyPort(s string) (int, error) {
+	port, err := strconv.Atoi(s)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid proxy port %q", s)
+	}
+	return port, nil
+}
+
+// proxyFromShareLink handles proxy?server=&port=&secret= (MTProxy) and socks?server=&port=&user=&pass= (SOCKS5).
+func proxyFromShareLink(kind string, q url.Values) (Proxy, error) {
+	host := strings.Trim(q.Get("server"), "[]")
+	if host == "" {
+		return nil, errors.New("proxy link has no server")
+	}
+	portStr := q.Get("port")
+	if portStr == "" {
+		portStr = map[string]string{"proxy": "443", "socks": "1080"}[kind]
+	}
+	port, err := parseProxyPort(portStr)
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
+	case "proxy":
+		// '+' in an unescaped base64 secret arrives as a space after query decoding
+		secret := strings.ReplaceAll(q.Get("secret"), " ", "+")
+		if secret == "" {
+			return nil, errors.New("proxy link has no secret")
+		}
+		return &MTProxy{BaseProxy: BaseProxy{Host: host, Port: port}, Secret: secret}, nil
+	case "socks":
+		return &Socks5Proxy{BaseProxy: BaseProxy{Host: host, Port: port}, Username: q.Get("user"), Password: q.Get("pass")}, nil
+	default:
+		return nil, fmt.Errorf("unsupported proxy link type %q", kind)
 	}
 }
 
@@ -1027,45 +1035,61 @@ func PackBotFileID(file any) string {
 switchFileType:
 	switch f := file.(type) {
 	case *DocumentObj:
+		if f == nil {
+			return ""
+		}
 		fID = f.ID
 		accessHash = f.AccessHash
-		fileType = 5
 		dcID = f.DcID
 		fileSize = f.Size
+		var voice, audio, round, video, sticker, animated bool
 		for _, attr := range f.Attributes {
 			switch attr := attr.(type) {
 			case *DocumentAttributeAudio:
-				if attr.Voice {
-					fileType = 3
-					break switchFileType
-				}
-				fileType = 9
-				break switchFileType
+				voice, audio = voice || attr.Voice, audio || !attr.Voice
 			case *DocumentAttributeVideo:
-				if attr.RoundMessage {
-					fileType = 13
-					break switchFileType
-				}
-				fileType = 4
-				break switchFileType
+				round, video = round || attr.RoundMessage, video || !attr.RoundMessage
 			case *DocumentAttributeSticker:
-				fileType = 8
-				break switchFileType
+				sticker = true
 			case *DocumentAttributeAnimated:
-				fileType = 10
-				break switchFileType
+				animated = true
 			}
 		}
+		switch {
+		case voice:
+			fileType = 3
+		case round:
+			fileType = 13
+		case sticker:
+			fileType = 8
+		case animated:
+			fileType = 10
+		case video:
+			fileType = 4
+		case audio:
+			fileType = 9
+		default:
+			fileType = 5
+		}
 	case *PhotoObj:
+		if f == nil {
+			return ""
+		}
 		fID = f.ID
 		accessHash = f.AccessHash
 		fileType = 2
 		dcID = f.DcID
 		fileSize = 0
 	case *MessageMediaDocument:
+		if f == nil {
+			return ""
+		}
 		file = f.Document
 		goto switchFileType
 	case *MessageMediaPhoto:
+		if f == nil {
+			return ""
+		}
 		file = f.Photo
 		goto switchFileType
 	default:

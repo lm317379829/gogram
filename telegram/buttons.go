@@ -22,7 +22,8 @@ func NewReplyKeyboard() *ReplyKeyboardBuilder { return &ReplyKeyboardBuilder{} }
 func (k *KeyboardBuilder) AddRow(b ...KeyboardInlineButton) *KeyboardBuilder {
 	p := make([]*KeyboardInlineButton, len(b))
 	for i := range b {
-		p[i] = &b[i]
+		btn := b[i]
+		p[i] = &btn
 	}
 	k.rows = append(k.rows, &KeyboardInlineButtonRow{Buttons: p})
 	return k
@@ -60,7 +61,8 @@ func (k *KeyboardBuilder) Build() *ReplyInlineMarkup { return &ReplyInlineMarkup
 func (k *ReplyKeyboardBuilder) AddRow(b ...KeyboardButton) *ReplyKeyboardBuilder {
 	p := make([]*KeyboardButton, len(b))
 	for i := range b {
-		p[i] = &b[i]
+		btn := b[i]
+		p[i] = &btn
 	}
 	k.rows = append(k.rows, &KeyboardButtonRow{Buttons: p})
 	return k
@@ -106,7 +108,7 @@ func (ButtonBuilder) RequestPoll(t string, q bool) KeyboardButton {
 func (ButtonBuilder) Clear() *ReplyKeyboardHide { return &ReplyKeyboardHide{} }
 
 func (m *NewMessage) Click(o ...any) (*MessagesBotCallbackAnswer, error) {
-	if m.ReplyMarkup() == nil {
+	if m == nil || m.Message == nil || m.Message.ReplyMarkup == nil {
 		return nil, errors.New("replyMarkup: message has no buttons")
 	}
 	mk, ok := (*m.ReplyMarkup()).(*ReplyInlineMarkup)

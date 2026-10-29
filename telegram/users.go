@@ -19,8 +19,8 @@ func (c *Client) GetMe() (*UserObj, error) {
 		return nil, fmt.Errorf("getting user: expected one self user, got %d", len(resp))
 	}
 	user, ok := resp[0].(*UserObj)
-	if !ok || user == nil {
-		return nil, errors.New("got wrong response: " + reflect.TypeOf(resp).String())
+	if !ok || user == nil || user.ID == 0 {
+		return nil, fmt.Errorf("getting user: expected a nonzero self user, got %T", resp[0])
 	}
 	c.setMe(user)
 	if c.Cache != nil {

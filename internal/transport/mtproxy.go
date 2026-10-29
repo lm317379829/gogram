@@ -74,7 +74,7 @@ func ParseMTProxySecret(secret string) (*MTProxyConfig, error) {
 	if isHex(secret) {
 		secretBytes, err = hex.DecodeString(secret)
 	} else {
-		secretBytes, err = base64.RawURLEncoding.DecodeString(secret)
+		secretBytes, err = base64.RawURLEncoding.DecodeString(strings.TrimRight(secret, "="))
 		if err != nil {
 			secretBytes, err = base64.StdEncoding.DecodeString(secret)
 		}

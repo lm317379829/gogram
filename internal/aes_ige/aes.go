@@ -159,8 +159,7 @@ func EncryptMessageWithTempKeys(msg []byte, nonceSecond, nonceServer *big.Int) (
 	hash := utils.Sha1Byte(msg)
 
 	totalLen := len(hash) + len(msg)
-	overflowedLen := totalLen % 16
-	needToAdd := 16 - overflowedLen
+	needToAdd := (16 - totalLen%16) % 16
 
 	msg = bytes.Join([][]byte{hash, msg, utils.RandomBytes(needToAdd)}, []byte{})
 	return encryptMessageWithTempKeys(msg, nonceSecond, nonceServer)
